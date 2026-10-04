@@ -51,6 +51,10 @@
 #   PREWARM=0         1 = stream the 48 GiB table once at boot to warm the page cache
 #   WORKERS=32        threads for the mmap gather
 #   EXTRA=            extra vllm flags passed verbatim
+#   PLUGIN_DIR=       host dir of vLLM general plugins (*.dist-info, mounted ro + put on PYTHONPATH).
+#                     REALTIME_DIR= (default /home/roger/expert-realtime) mounts rw for the expert_rt
+#                     plugin's real-traffic counters, merged into spark:9102 by expert_exporter.py.
+#                     e.g. PLUGIN_DIR=/home/roger/vllm_stuff/tools/expert_plugin
 #   COMPILE_CACHE=    where to keep vLLM's compiled graphs and FlashInfer's JIT modules across
 #                     boots. Unset (default) = inside the container, which this script recreates
 #                     every time, so they are rebuilt on every boot (80 s of init engine, see
@@ -82,6 +86,7 @@ GPU_MEM="${GPU_MEM:-0.80}"
 MTP="${MTP:-2}"
 KV_DTYPE="${KV_DTYPE:-auto}"
 KV_CACHE_MEM="${KV_CACHE_MEM:-}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
 PROM_MULTIPROC="${PROM_MULTIPROC:-0}"
 PREWARM="${PREWARM:-0}"
 EXTRA="${EXTRA:-}"
@@ -256,6 +261,26 @@ case "$COMPILE_CACHE" in
   *)  CACHE_MNT=(-v "${COMPILE_CACHE}-vllm:/root/.cache/vllm"
                 -v "${COMPILE_CACHE}-flashinfer:/root/.cache/flashinfer") ;;
 esac
+# General plugins (see PLUGIN_DIR above): a dir with *.dist-info on PYTHONPATH is discovered by
+# importlib.metadata without any pip install. expert_rt (vllm-serving/tools/expert_plugin) counts
+# REAL-TRAFFIC expert routing in the worker process and flushes textfiles to REALTIME_DIR every
+# 10 s; the mount is the only way data leaves the container. Inert when PLUGIN_DIR is unset.
+PLUGIN_MNT=()
+if [ -n "${PLUGIN_DIR:-}" ]; then
+  REALTIME_DIR="${REALTIME_DIR:-/home/roger/expert-realtime}"
+  PLUGIN_MNT=(-v "$PLUGIN_DIR:/opt/vllm-plugins:ro" -v "$REALTIME_DIR:/var/lib/expert-realtime:rw"
+              -e PYTHONPATH=/opt/vllm-plugins)
+fi
+
+# Do not stop a container we cannot start again. Line ~193 inspects "$IMAGE" for its base label
+# with `2>/dev/null || true`, so a missing image is silent there; without this guard the rm below
+# removes the serving container, `docker run` then fails, and the EXIT trap deletes the stub -
+# leaving nothing running. That is exactly the 10-01 14:37 outage.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "serve.sh: image '$IMAGE' is not in docker - refusing to stop the running '$NAME'" \
+       "(nothing would start it back up). Build it first: scripts/build.sh" >&2
+  exit 1
+fi
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # If docker run itself fails (port already bound, ...) do not leave a Created container behind.
@@ -265,7 +290,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   "${PROM_ARGS[@]}" \
-  "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" \
+  "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" "${PLUGIN_MNT[@]}" \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
   -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" -e VLLM_FP8_PAD_M4="$PAD_M4" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
@@ -279,7 +304,7 @@ docker run -d --name "$NAME" --restart unless-stopped \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" ${KV_CACHE_MEM:+--kv-cache-memory-bytes "$KV_CACHE_MEM"} \
     "${OVR_ARGS[@]}" "${LOGARGS[@]}" $EXTRA \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser "$REASONING_PARSER" \
     "${TEMPLATE_ARGS[@]}" "${SPEC[@]}"
 
 # Fail loudly instead of printing a success line over a dead container: give vLLM a few
