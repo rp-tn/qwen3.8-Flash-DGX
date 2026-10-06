@@ -306,7 +306,7 @@ PLUGIN_MNT=()
 if [ -n "${PLUGIN_DIR:-}" ]; then
   REALTIME_DIR="${REALTIME_DIR:-/home/roger/expert-realtime}"
   PLUGIN_MNT=(-v "$PLUGIN_DIR:/opt/vllm-plugins:ro" -v "$REALTIME_DIR:/var/lib/expert-realtime:rw"
-              -e PYTHONPATH=/opt/vllm-plugins)
+              -e PYTHONPATH=/opt/vllm-plugins -e EOS_GUARD="${EOS_GUARD:-1}")
 fi
 
 # Do not stop a container we cannot start again. Line ~193 inspects "$IMAGE" for its base label
