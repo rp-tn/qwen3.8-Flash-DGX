@@ -2,7 +2,7 @@
 # vllm_watch.py — live, colour-coded per-session view of what the server is doing: prompts
 # (system prompt masked), reasoning, outputs and engine stats, interleaved from `docker logs`.
 # Contributed by @0x3dlux (issue #12). Needs the server started with LOG_REQUESTS=1
-# (scripts/serve.sh adds VLLM_LOGGING_LEVEL=DEBUG --enable-log-requests --enable-log-outputs);
+# (scripts/serve.sh adds --enable-log-requests --enable-log-outputs, DEBUG on the request logger);
 # that logs every prompt and answer to the Docker json log, so keep it for debugging sessions.
 #   tools/vllm_watch.py [--name qwen38-flash] [--lines 200]
 import argparse

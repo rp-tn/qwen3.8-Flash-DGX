@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """CPU unit test for the exact QSA top-k path added by patch_qsa_exact_topk.py (no GPU needed).
 
-    docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx test_qsa_exact_topk_cpu.py
+    docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_qsa_exact_topk_cpu.py
 """
 import os
 import torch
 
-QSA = "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
+QSA = "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py"
 src = open(QSA).read()
 tail = src[src.index("# --- GX10: QSA top-k variants"):]
 ns = {"torch": torch, "os": os}

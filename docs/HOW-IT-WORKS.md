@@ -42,50 +42,49 @@ the native 262k or a single 500k request with YaRN.
 ## The patch (`src/vllm_ple_mmap.py`)
 
 Enabled by `VLLM_PLE_MMAP=1`; a complete no-op otherwise. It patches exactly one
-class, `Qwen3_8FlashNextNGramEmbedding`, in three small ways:
+class, `Qwen4ExpNGramEmbedding` (`vllm/models/qwen4_exp/nvidia/ngram_embedding.py`), in
+three small ways:
 
-1. **`__init__`** — swap the 44/95 GiB `VocabParallelEmbedding` for a tiny
-   placeholder. No large parameter is ever allocated. The placeholder's `forward(ids)`
-   gathers rows from `np.memmap` views of the shards (dedup + sort for locality, a
-   thread pool so page faults overlap), returns an fp8 tensor on the GPU.
+1. **`__init__`** — run the stock constructor with the resident embedding classes
+   (`Qwen4ExpPLEDeviceEmbedding`, and `Qwen4ExpPLEPinnedHostEmbedding` for engram CPU
+   offload) swapped for a tiny placeholder. No large parameter is ever allocated. The
+   placeholder's lookup gathers rows from `np.memmap` views of the shards (dedup + sort for
+   locality, a thread pool so page faults overlap) and returns an fp8 tensor on the GPU; it
+   also answers what the layer asks of its embedding (`dequantize`, `supports_prefetch`, a
+   dummy `weight` for the init log line).
 
 2. **`load_weights`** — drop the 128 shard tensors on the floor (they're served from
-   disk) and keep only the global FP8 `weight_scale`, stored as
-   `_offload_weight_scale` — which the **unmodified** `Qwen3_8FlashNextPLELayer.
-   _dequantize_embeddings` already knows how to consume. Then open the memmaps.
+   disk) and keep only the global FP8 `weight_scale`, which the placeholder's `dequantize`
+   applies. Then open the memmaps.
 
-3. **`forward_impl`** — wrap the hashing+lookup in a custom op
-   `vllm::ple_mmap_lookup`. This is the crucial bit for GB10 (below).
+3. **`forward`** — keep the stock n-gram hashing (a Triton kernel, `compute_ngram_ids`) and
+   route the lookup through a custom op, `vllm::ple_mmap_lookup_ids`. This is the crucial
+   bit for GB10 (below).
 
 Everything else — the n-gram hashing, the short-conv, the dequant, the sparse
 attention — is stock vLLM.
 
 ## Three GB10 bugs this works around
 
-Bringing the official image up on a real Spark with real weights surfaced three
-issues. All are handled by the patch + the flags in `scripts/serve.sh`:
+Bringing the model up on a real Spark with real weights surfaced three issues. All are
+handled by the patch + the flags in `scripts/serve.sh`:
 
-1. **`Cannot copy between CPU and CUDA tensors during CUDA graph capture`.**
-   The gather is CPU work plus a pageable host→device copy; that cannot live inside a
-   captured CUDA graph. Fix: the lookup is a **custom op declared as a splitting op**,
-   so vLLM runs it *between* graph segments. Use `-cc.cudagraph_mode=PIECEWISE` (never
-   `FULL*`). `--enforce-eager` also avoids it but is slower — and note it does **not**
-   fully suppress capture here (the mamba/short-conv path still captures), so PIECEWISE
-   + the splitting op is the right answer.
+1. **The gather cannot live inside a CUDA graph.** It is CPU work plus a pageable
+   host→device copy (`Cannot copy between CPU and CUDA tensors during CUDA graph capture`, or
+   `cudaErrorStreamCaptureUnsupported` for the synchronize). vLLM v0.30 captures this model
+   with *breakable* piecewise CUDA graphs, so the lookup ends a graph segment itself and runs
+   eagerly between two segments — details in [vLLM v0.30 specifics](#vllm-v030-specifics).
+   Never `FULL*` capture. `--enforce-eager` also avoids it but is slower.
 
 2. **`KeyError` on the layer registry during capture.** The custom op looks the layer
-   up by name; registering it inside `forward_impl` fails because torch.compile does
-   not re-run that Python line on graph replay. Fix: register in `__init__`.
+   up by name; registering it in the forward pass fails because a graph replay does not
+   re-run that Python line. Fix: register in `__init__`.
 
-3. **Two stock-model issues on sm_121, unrelated to this patch but required to run:**
-   - prefix caching crashed (`CUBLAS_STATUS_INTERNAL_ERROR` in a GDN `in_proj` GEMM, later
-     `illegal memory access` in the Mamba state copy) on the cached-block path. The root
-     cause turned out to be a vLLM block-size bug, fixed in this image — see
-     [Prefix caching](#prefix-caching-the-root-cause-and-the-fix) below. The old advice
-     (`--no-enable-prefix-caching`) is no longer needed.
-   - full `torch.compile` off — an Inductor int64-indexing assert
-     (`index out of bounds`) fires in the embedding gather codegen on sm_121. PIECEWISE
-     capture with compile disabled on the splitting op sidesteps it.
+3. **Prefix caching crashed** (`CUBLAS_STATUS_INTERNAL_ERROR` in a GDN `in_proj` GEMM, later
+   `illegal memory access` in the Mamba state copy) on the cached-block path. Unrelated to
+   this patch but required to run: the root cause is a vLLM block-size bug, fixed in this
+   image — see [Prefix caching](#prefix-caching-the-root-cause-and-the-fix) below. The old
+   advice (`--no-enable-prefix-caching`) is no longer needed.
 
 ## Long context: what works and what does not
 
@@ -190,7 +189,8 @@ aggregate throughput of ~267 tok/s at 48 streams with page-fault cost per token
 
 - vLLM recipe: <https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next>
 - vLLM PR (Flash-Next support): <https://github.com/vllm-project/vllm/pull/53896>
-- vLLM v0.29.0 release (first official build with the model, as `qwen4_exp`): <https://github.com/vllm-project/vllm/releases/tag/v0.29.0> — see [the port notes](#the-vllm-v0290-port-dockerfilev029)
+- vLLM v0.29.0 release (first official build with the model, as `qwen4_exp`): <https://github.com/vllm-project/vllm/releases/tag/v0.29.0> — port notes in [HISTORY.md](HISTORY.md#the-vllm-v0290-port-dockerfilev029)
+- vLLM v0.30.0 release (the base image): <https://github.com/vllm-project/vllm/releases/tag/v0.30.0> — see [vLLM v0.30 specifics](#vllm-v030-specifics)
 - NVFP4 checkpoints: <https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4> (the default since 2026-09-14) and <https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4>
 - SGLang day-0 write-up (PLE offload mechanics): <https://www.lmsys.org/blog/2026-08-26-qwen-flash-next>
 
@@ -296,7 +296,7 @@ multi-CTA path a deterministic emission (per-CTA counts + prefix over CTAs, ties
 index). Micro-benchmark cost is 1.3–4× per call, which at model level is noise.
 
 We build it as a standalone extension (`_C_det.so`) with the image's `nvcc` at `docker build`
-time, from his repo at a pinned commit, and route `qsa_select_paged_tokens` to
+time, from his repo at a pinned commit, and route the QSA indexer's `_topk` to
 `torch.ops._C_det.persistent_topk` when `VLLM_QSA_DET_TOPK=1`. Measured on the GX10 (hybrid,
 MTP=2, prefix caching, same box, same bench script and prompts; the exact and stock columns are the earlier runs from the sections above):
 
@@ -324,7 +324,7 @@ Two changes taken as ideas from MiaAI-Lab's recipe and reimplemented here.
 **Reduced draft vocabulary.** `llm_base_proposer._maybe_share_lm_head` gives the MTP draft the
 target's `lm_head`, so each draft step is a (B × 2560) · (2560 × 248,320) bf16 GEMV: 1.27 GiB
 read per drafted token, twice per step at MTP=2, on a decode step that is bandwidth-bound.
-`src/patch_mtp_draft_vocab.py` wraps `Qwen3_8FlashNextMTP.compute_logits`: on first call it
+`src/patch_mtp_draft_vocab.py` wraps `Qwen4ExpMTP.compute_logits`: on first call it
 slices the shared head to the ids in `VLLM_MTP_DRAFT_VOCAB` (a private 65,536 × 2560 copy,
 320 MiB), then each call computes the reduced logits and scatters them into a full-width tensor
 filled with −∞, so `argmax`, the rejection sampler and `VocabMapping` see the usual shape. The
@@ -434,192 +434,201 @@ parent snapshots plus the Inferact blob — HF cache tooling cannot see that, so
 prune either parent.
 
 
-### The blockwise-fp8 GEMM's `M % 4` slow path (patch 9, opt-in)
+## Weight loading: the per-expert H2D copy (patch 14)
 
-Found by [@jschmied](https://github.com/jschmied) (issue #3): the preview image's sm_12x
-blockwise-fp8 cutlass dispatch takes `swap_ab = (M <= 64) || (M % 4 != 0)`, and that path is
-slow. Kernel micro-bench on the GX10 (K=4096, N=8192, our image):
+About 9 of the ~11 minutes of a boot were "Loading weights": main model 450–541 s, MTP drafter
+~46 s, on `nvidia/Qwen3.8-Flash-Next-NVFP4` in the hybrid layout. Storage was not the bottleneck.
+Local NVMe and an NFS share loaded within the ±40 s boot-to-boot noise of each other, iowait
+stayed around 0.5%, and one core was busy.
 
-| rows M | aligned | M % 4 ≠ 0 | padded to 4 |
+A py-spy profile of the EngineCore during loading (60 s, 99% of samples in `load_weights`):
+
+| self time | frame |
+|---|---|
+| 59.6% | `RoutedExperts._load_w13` → `expert_data.copy_(loaded_weight)` |
+| 29.6% | `RoutedExperts._load_w2` → `expert_data.copy_(loaded_weight)` |
+| ~5% | `FusedMoE.load_weights` |
+| ~4% | linear layers (`load_merged_column_weight`, `load_row_parallel_weight`, `load_qkv_weight`) |
+
+Every routed expert arrives as separate tensors: 48 layers × 512 experts × 3 projections, each an
+800 KiB NVFP4 weight plus a 100 KiB fp8 block scale, about 149k tensors in all. vLLM copies each
+one to the GPU on its own, straight from the safetensors mmap view. In the native profile the time
+is `cuMemcpyHtoDAsync_v2` from pageable memory, with the CPU spinning in `libcuda` through each
+small synchronous copy.
+
+A micro-benchmark on one real 9 GiB expert shard (`tools/bench_moe_load.py`). Each variant ran in
+a fresh process on a shard no earlier run had touched, with the client page cache dropped, and
+every variant produced byte-identical weights:
+
+| variant | ms / tensor |
+|---|---|
+| **A** vLLM today: mmap view → `param.copy_()` | 1.74 |
+| **E** the shard read into the page cache first, then A | 1.86–1.89 |
+| **F** `.clone()` the mmap view, then the same `copy_` | **0.23** |
+| **B** a reused pinned bounce buffer | 0.22–0.26 |
+| **C** pinned staging per 3,072 tensors, one H2D + a GPU scatter | 0.25 |
+
+The copy is slow whenever its source is a file-backed page, cached (E) or not (A). From ordinary
+anonymous memory it is fast (F), and a plain clone does as well as pinned staging (B, C). The cause
+is not verified. The likely place is the driver's pageable-copy path on GB10's unified memory, which
+appears to handle file-backed pages far more expensively than anonymous ones. Reading the data is
+not the cost: copying the same mmap view into host memory takes 0.03–0.7 ms depending on the
+cache state, and a `pread()` 0.04–0.07 ms.
+
+The fix is `src/patch_moe_load_clone.py`. In `_load_w13` and `_load_w2`, when the source is a CPU
+tensor that is not pinned and the destination is not on the CPU, the copy now reads from
+`loaded_weight.clone()`. Weights and block scales both go through these two sites, and so do the
+MTP drafter's block-fp8 experts. The memory cost is one transient tensor of at most 800 KiB.
+`VLLM_LOAD_CLONE=0` restores the stock copy.
+
+One boot on the preview image (`MODE=hybrid`, NVIDIA checkpoint, weights on NFS, compile cache
+reused):
+
+| | before | patch 14 |
+|---|---|---|
+| Loading weights, main model | 450–541 s | **150 s** |
+| Loading weights, MTP drafter | 46 s | **32 s** |
+| startup to "Application startup complete" | ~11 min | **4 min 32 s** |
+
+Model memory (74.9 GiB), the KV pool (718k tokens, within the usual boot-to-boot range) and
+`scripts/smoke-test.sh` (prefix-cache hit, identical first-token logprobs across runs, 35 tok/s
+decode) are unchanged. RadixArk's checkpoint has the same per-expert layout and should benefit the
+same way, but it has not been measured.
+
+Ruled out:
+
+- `--safetensors-load-strategy prefetch`. vLLM skips it because the checkpoint is larger than free
+  RAM, and E shows that a warm page cache would not help anyway.
+- `eager` and `enable_multithread_load`. Both read whole files into RAM, and one file is the 50 GiB
+  PLE shard, with only 2–5 GiB free during loading.
+
+The remaining 150 s is covered in the next section.
+
+## The rest of weight loading (patches 15–18)
+
+With patch 14 in, one boot was profiled end to end (`tools/profile_boot.sh`: py-spy on every
+process in the container, 10 s slices, 100 Hz; summarized with `tools/pyspy_slices.py`). It
+matched the unprofiled boot, 149 + 32 s of loading and 4 min 32 s to ready. The main load:
+
+| s (≈) | where | cause |
+|---|---|---|
+| 45 | patch 14's `.clone()` | page-faulting cold file pages through the mmap view, ~1.4 GiB/s |
+| 26 | `_load_w13` / `_load_w2` `copy_` and the loader chain | the per-tensor H2D copy and its Python overhead |
+| 25 | `FusedMoE.load_weights` | pure Python: every tensor is substring-matched against all 1,536 expert-mapping entries (103 µs × 297k tensors = 30 s in isolation; same loop on vLLM `main`) |
+| 25 | linear layers (`parameter.py`, `linear.py`) | `param.copy_` straight from the mmap view, the slow path patch 14 fixed for the experts |
+| 16 | `vocab_parallel_embedding.py` | `embed_tokens` + `lm_head`, 2 × 1.2 GiB H2D straight from the mmap (~150 MB/s) |
+| 13–15 | `PREWARM=1` | streams the 47.7 GiB PLE table into the page cache |
+
+The MTP drafter's 32 s: ~15 s loading its own `embed_tokens` + `lm_head`, which vLLM then deletes
+to share the target's, and ~13 s walking all 11 files / 299,845 tensors to keep ~3,100
+(`remap_weight_names` filters after each tensor was created).
+
+Reading one whole 9 GiB expert shard in the loader's order (`f.keys()`), client page cache cold
+(checked with `mincore`), CPU only, bytes identical:
+
+| read path | 9 GiB shard |
+|---|---|
+| mmap `get_tensor` + `.clone()` (patch 14) | 3.95–4.13 s = 2.2 GiB/s |
+| `pread` each tensor into a fresh CPU tensor | **0.82 s = 10.9 GiB/s** |
+
+The four patches, each on by default with its own switch:
+
+| patch | switch | what |
+|---|---|---|
+| 15 `src/patch_load_pread.py` | `VLLM_LOAD_PREAD=0` | `safetensors_weights_iterator`: tensors ≤ 64 MiB are `pread` into ordinary memory, and their storage is tagged so patch 14 skips its now redundant clone. Larger tensors and every `ngram_embedding.shard_*` stay mmap views, so the PLE table is never read into RAM. Needs 14. |
+| 16 `src/patch_moe_name_index.py` | `VLLM_MOE_NAME_INDEX=0` | the expert loader looks names up in an index (`{len: {name: [idx]}}` at each `experts.` position) instead of scanning all 1,536 entries; same entries, same order, and the original's `break` on fused names. Falls back to the full scan if an entry does not start with `experts.`. |
+| 17 `src/patch_embed_chunked_copy.py` | `VLLM_LOAD_EMBED_CHUNK=0` | `VocabParallelEmbedding.weight_loader` copies CPU → GPU in 64 MiB row blocks, each cloned into ordinary memory first. |
+| 18 `src/patch_mtp_name_prefilter.py` | `VLLM_MTP_NAME_PREFILTER=0` | wraps vLLM's `should_skip_weight` (the hook the iterator asks before reading each tensor) with an optional keep-filter; the drafter's `load_weights` sets it to `_remap_mtp_weight_name(n) is not None` while it loads, so it skips the other 296,742 tensors unread. Not used when the model has secondary weight sources. |
+
+Boots on the preview image (`MODE=hybrid`, NVIDIA checkpoint, weights on NFS over RDMA, compile
+cache reused):
+
+| | patch 14 | + 15–17 | + 18 |
 |---|---|---|---|
-| 501 / 1,201 / 1,601 | 0.22 / 0.47 / 0.63 ms | 0.37 / 0.79 / 1.09 ms (×1.7) | = aligned |
-| 2,049 / 2,401 / 3,001 | 0.73 / 0.87 / 1.07 ms | 8.2 / 9.6 / 12.0 ms (**×10–11**) | = aligned |
-| 8,001 / 32,001 | 9.8 / 40 ms | 37 / 147 ms (×3.7) | = aligned |
+| Loading weights, main model | 149 s | 35 s | 35.5 s |
+| Loading weights, MTP drafter | 32 s | 12 s | **1.2 s** |
+| startup to "Application startup complete" | 4 min 32 s | 2 min 13 s | **2 min 8 s** |
 
-Upstream removed the clause in C++ (vllm#52775, 2026-08-19); his `fp8_m4pad_patch.py` pads M
-to a multiple of 4 (zero rows, unit scale rows, output sliced) inside an opaque custom op so
-`torch.compile` cannot freeze the branch at the profiling shape. Why it does not show on our
-default config: with `--enable-prefix-caching` the scheduler's Mamba align mode
-(`_mamba_block_aligned_split`) clips every prefill chunk to the 1,600-token block boundary, so
-the large chunks always reach the GEMM with M % 4 == 0 and only the last chunk of a prompt has an
-arbitrary row count. Same-session A/B on the hybrid (MTP=2, prefix caching): 8k 3.33 → 3.24 s,
-32k 11.63 → 10.97 s, needle 48.0 → 47.2 s, salted prefills within noise; prompts built to leave a
-misaligned last chunk above 2,048 rows (8,801 / 8,803 tokens) cost the same as aligned ones
-(3.60–3.69 s). Hence `PAD_M4=0` by default. With prefix caching off the chunks are not aligned and
-his −40% TTFT at 8k applies — that is the case the option is for. NVFP4 mode never calls this GEMM.
+- CPU tests, in the image: `src/test_moe_name_index_cpu.py` (22,516 name/config cases, including
+  EPLB redundant experts, LoRA prefixes and fused names, identical to the original loop, 73.5 →
+  1.1 µs per tensor); `src/test_load_patches_cpu.py` (every small tensor byte-identical to the stock
+  iterator on three real files, embeddings and all 128 PLE shards stay unread views);
+  `src/test_mtp_prefilter_cpu.py` (on the whole snapshot the filtered iterator yields exactly the
+  3,103 names the drafter keeps).
+- Greedy first-token log-probs on five reference prompts: identical to the patch 14 boot after 15–17
+  and again after 18. `scripts/smoke-test.sh`: deterministic, prefix-cache hit, 35.4 tok/s decode.
+- The drafter: a greedy probe cannot catch a bad drafter (the target verifies every token), so
+  `vllm:spec_decode_num_{draft,accepted}_tokens_total` were read around one probe. 1,208 drafted /
+  864 accepted with patch 18, and the same on an A/B boot with `VLLM_MTP_NAME_PREFILTER=0`.
+- Model memory 74.9 GiB, unchanged; the KV pool stays inside the usual boot-to-boot range.
+
+On vLLM v0.30 the call sites are the same; patch 18 finds `mtp.py` under the `qwen4_exp` package
+and keeps its `mapper=` argument.
+
+Two notes. Most of patch 15's gain is the read path, so it should matter more where the checkpoint
+pages come off local disk rather than out of an NFS server's RAM, as here; that has not been
+measured. And the weight stream still pushes most of the prewarmed PLE table out of the page cache
+(8.5% of it resident at "Application startup complete"); that affects the first requests, not the
+boot.
+
+
+## vLLM v0.30 specifics
+
+Three things in vLLM v0.30.0 shape how the patches hook in. (How they were ported from the
+earlier bases is in [HISTORY.md](HISTORY.md).)
+
+**PLE lookup.** The n-gram module left `ple_layer.py` for `ngram_embedding.py`. The hashing is a
+Triton kernel (`ops/ple.py`) called through `compute_ngram_ids`, and the lookup goes through
+`Qwen4ExpPLEDeviceEmbedding`, or `Qwen4ExpPLEPinnedHostEmbedding` with engram CPU offload.
+`src/vllm_ple_mmap.py` swaps both embedding classes for the mmap placeholder during `__init__`,
+keeps the stock hashing, and sends the lookup through the `ple_mmap_lookup_ids` op
+([The patch](#the-patch-srcvllm_ple_mmappy)).
+
+**CUDA graphs.** v0.30 lists Qwen4Exp among the architectures that get *breakable* CUDA graphs by
+default (`VLLM_USE_BREAKABLE_CUDAGRAPH`): torch.compile is off and one capture drives the whole
+forward, ending a graph segment around every op that must run eagerly. Our gather is CPU work plus
+a host-to-device copy, so it cannot be captured. Three consequences, each hit on a real boot:
+
+1. The gather ends the segment itself through the capture's `add_eager` (a synchronize inside a
+   capture is `cudaErrorStreamCaptureUnsupported`).
+2. It writes into a persistent per-layer output buffer, sliced per batch. An eager segment must
+   write to the same address on every replay.
+3. At capture time the kernels queued before it, the n-gram hashing among them, are recorded and
+   not run, so the ids hold garbage. While a capture context is open, even paused, the eager
+   segment only zero-fills its output. At replay the segments run in order and the ids are real.
+
+`-cc.splitting_ops` in `scripts/serve.sh` carries a list for the FX path
+(`VLLM_USE_BREAKABLE_CUDAGRAPH=0`), which has not been measured.
+
+**QSA top-k.** vllm#54513 split the indexer into prefill and decode paths that share one `_topk`
+helper in `ops/qsa_indexer.py`. `patch_qsa_exact_topk.py` patches that helper, and
+`src/patch_qsadet.py` wires the deterministic kernel into it (the upstream wiring script only
+knew the older file). The stock kernel changed too (vllm#54110, vllm#56346); `scripts/smoke-test.sh`
+and the tournament's determinism probe re-measure GB10 determinism on every boot, and both pass with
+our kernel.
+
+Patches 12 and 13 target the v0.30 parser engine; the 30-case test module passes. Patches 3, 9
+and 11 of the earlier bases are upstream fixes that v0.30 ships (vllm#50729, vllm#52775, vllm#55513).
 
 ## fp8 KV cache on the QSA path (opt-in)
 
-vLLM already had the plumbing (`kv_quant_mode`, `_k_scale`/`_v_scale`, allocation and
-writes) — what was missing for this model was the read side: the QSA Triton kernels
-loaded the cache as bf16 and five guards rejected anything else.
-[@Nanetnounou](https://github.com/Nanetnounou)'s `src/patch_qsa_fp8_kv.py`
-([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6)) wires vLLM's own
-`_cast_kv_tile` into the decode and MQA (block-selector) kernels, reinterprets the
-`uint8` allocation as `float8_e4m3fn` — for the main KV *and* the indexer's raw-key ring,
-which otherwise picks arbitrary blocks — halves `block_n` under quantization to stay
-under the GB10's 101,376-byte shared memory, and neutralises the dtype guard inherited
-from `FlashAttentionImpl` (whose kernels QSA never calls). Inert with `--kv-cache-dtype auto`.
+`src/patch_qsa_fp8_kv.py`, after [@Nanetnounou](https://github.com/Nanetnounou)'s original for the
+preview image ([issue #6](https://github.com/blazux/qwen3.8-Flash-DGX/issues/6)). vLLM quantizes on
+the write side already (`do_kv_cache_update` with the layer's `_k_scale`/`_v_scale`), so the patch
+only touches the read side: the split-K kernel dequantizes K and V with vLLM's own `_cast_kv_tile`
+(fp8 per-tensor), BLOCK_N is halved under quantization to fit sm_121's 101,376-byte shared memory,
+the warmup compiles the fp8 specialization, uint8 storage is reinterpreted as fp8 (a bit view), and
+the bf16-only guards are widened, the one inherited from `FlashAttentionImpl` included, since QSA
+never uses its kernels. The QSA indexer's caches are v0.30's own: the raw-key ring stays bf16 and the
+compressed keys have their own dtype (`indexer_kv_dtype`, native fp8, vllm#54890). The read passes
+the layer's real scales (the preview version read with a fixed 1.0, which only matched because the
+writes used 1.0 as well). With `--kv-cache-dtype auto` the branch is compiled out: first-token
+log-probs 5/5 identical to the image without the patch. `tests/test_fp8_kv_read.py` checks on a GPU
+that the fp8 read path gives bit-identical attention output.
 
-Measured (hybrid, MTP=2, exact top-k, prefix caching, `GPU_MEM=0.80`, `CTX=1000000` YaRN):
-KV pool 1,219,879 tokens (bf16 at 500k: 634k) and a 1M single request boots with 1.22×
-concurrency; decode 27.9 vs 30.8 tok/s, prefill 32k 1,254 vs 1,794 tok/s, needle 92k
-89 s vs 69 s; tournament 45/51 with the usual b6/c5 failures, but `b3_itinerary` falls
-from 6/6 to 2/6 passes (and its one success took 193 s instead of ~50 s; the failures ran
-to the 412 s cap). vLLM raises the attention block to 3,184 tokens in this mode to keep
-attention and Mamba pages equal. Note for anyone sizing this: the fp8 saving applies to
-the attention K/V only — the GDN/PLE recurrent states, the QSA compressed keys and the
-raw-key ring stay as they are — which is why bf16 at 1M asked for 26.3 GiB and fp8 gets
-1M into 17 GiB.
-
-We keep bf16 in production: the model's speed is our scarcest resource and the b3
-regression is the kind of long-reasoning case we care about. The option is there for
-workloads that need the context.
-
-## The vLLM v0.29.0 port (`Dockerfile.v0.29`)
-
-Everything above was built on Qwen's preview image (`qwenllm/qwen3.8-flash-next-vllm`,
-a vLLM `0.20.x` dev build carrying the model as `vllm/models/qwen3_8_flash_next`). vLLM
-**v0.29.0** is the first official release with the model in-tree, renamed
-`vllm/models/qwen4_exp` (classes `Qwen4Exp*`, ops `vllm::qwen4_exp_*`), with an arm64
-image. [@ChengYen-Tang](https://github.com/ChengYen-Tang) asked whether the recipe would
-move ([issue #14](https://github.com/blazux/qwen3.8-Flash-DGX/issues/14)); this is what the
-port took and what it measures.
-
-**Patch by patch.** Every path in the Dockerfile moves from
-`vllm/models/qwen3_8_flash_next/nvidia/` to `vllm/models/qwen4_exp/nvidia/`; beyond that:
-
-- **3 (vllm#50729, Mamba state-copy race) and 9 (fp8 GEMM `M%4`, vllm#52775) are in the
-  release** and are not applied. `PAD_M4` is therefore a no-op on this base and
-  `scripts/serve.sh` says so.
-- **4 (prefix-caching block size) is still needed.** `v1/engine/core.py` still overwrites
-  `cache_config.block_size` with the *smallest* group block size; the worker's align-mode
-  state-slot seed and the scheduler's block-aligned prefill split now read
-  `mamba_block_size` / the scheduler's own `block_size` (the LCM of the groups), so the
-  same two-line fix applies. Prefix-cache hits are bit-exact (log-prob delta 0.0000 on
-  cached vs uncached prefills, four prompts).
-- **1 (PLE mmap) is rewritten.** The preview layer did hashing and lookup in one Python
-  `forward_impl`, which we replaced wholesale. The release splits it: a compiled op
-  `qwen4_exp_compute_ple_ngram_ids` computes the n-gram ids on the GPU, then a
-  `PLEVocabParallelEmbedding` (in `common/ple.py`) looks them up and hands the layer a
-  `weight_scale` for the FP8 dequant. We keep the stock id op and swap only the embedding:
-  `apply()` detects the layout (no `forward_impl` → v0.29), wraps `__init__` so the
-  embedding is our `_MmapNgramEmbedding` (the `ple_layer` module's reference to
-  `PLEVocabParallelEmbedding` is replaced for the duration of the constructor), overrides
-  `load_weights` to drop the table shards and keep only `weight_scale`, and overrides
-  `forward` to call the stock id op followed by a new splitting op,
-  `vllm::ple_mmap_lookup_ids(ngram_ids, output, layer_name)`, which gathers the rows from
-  the mmap into a pinned buffer and copies them into `output`. Same `MmapPleTable`, same
-  workers/chunk/prewarm/madvise knobs, same 48 GiB saved. One structural difference: the
-  ids now live on the GPU, so each lookup starts with a device→host copy of 16 × N int64s
-  (the preview computed them on the CPU). In the decode logs it is invisible (1.9–2.1 ms
-  per op vs 1.1–1.3 ms of pure gather); on prefill it is inside the same 2,500–3,000 tok/s
-  band as the preview image.
-- **2, 5, 6, 8, 10 apply as-is** once re-targeted. The draft-vocabulary hook now finds the
-  MTP class by pattern (`class \w+MTP\(`) instead of by name, so one file serves both bases.
-- **7 (fp8 KV on the QSA path) is not ported yet.** The QSA Triton kernels moved and were
-  edited upstream; the patch needs a re-derivation, not a path change. `scripts/serve.sh`
-  refuses `KV_DTYPE≠auto` on this base rather than silently running bf16.
-- **11 differs by base; on this one it is a backport of vllm#55513.** NVIDIA's own checkpoint
-  needs it for MTP: the drafter's experts are blockwise fp8 under a mixed-precision config, and
-  v0.29.0 misses them in two ways (see
-  [NVIDIA's NVFP4 checkpoint](#nvidias-nvfp4-checkpoint-block-fp8-mtp-experts-under-a-mixed-precision-config-patch-11-temporary)).
-  `src/patch_block_fp8_mtp.py` applies the PR's two runtime changes. The draft config now moves
-  `quantized_layers` to the drafter's runtime index, as it already did `exclude_modules`, and the
-  mixed config sends `FP8_PB_WO` / `FP8_BLOCK_SCALES` experts to vLLM's own `Fp8MoEMethod` with a
-  block `Fp8Config`. It leaves out the PR's `has_blocked_weights` hunk: v0.29.0's mixed config has
-  no such method, and that gate only picks the CUDA `QuantFP8` op for speed, while the MoE path
-  quantizes its input with `per_token_group_quant_fp8` directly. RadixArk's checkpoint (quant_algo
-  `NVFP4`, no `quantized_layers`) is unaffected. The preview image keeps the FP8_BLOCK_SCALES shim.
-  Measured on a DGX Spark with an NVIDIA-base checkpoint (`MODE=nvfp4`, MTP=2):
-  - the draft experts load on vLLM's DeepGEMM FP8 MoE backend;
-  - draft acceptance is 70.9% over four greedy prompts (539 of 760 drafted tokens, identical on two builds);
-  - the KV pool is 517k–542k tokens at `GPU_MEM=0.80` across three boots;
-  - the smoke test's determinism and prefix-cache checks pass.
-
-  The hybrid layout works on it too. With `prepare-hybrid.sh`'s fp8 side layers (`MODE=hybrid`, which
-  sets `VLLM_USE_DEEP_GEMM=0`), the draft experts load on the Triton FP8 MoE backend and the KV pool
-  grows to 658,980 tokens. Draft acceptance on the same four prompts is 65.9% (382 of 580 drafted
-  tokens; the fp8 side layers change the greedy paths), and the smoke test passes.
-
-**Serving.** The splitting-op list changes names (`vllm::qwen4_exp_ple_short_conv`,
-`vllm::qwen4_exp_qsa_with_output`, and `vllm::qwen4_exp_compute_ple_ngram_ids` must be in
-it too, or the id op gets captured with the lookup after it), and the new lookup op is
-`vllm::ple_mmap_lookup_ids`. Both Dockerfiles stamp `LABEL qwen38.base=preview|v0.29` and
-`serve.sh` reads it, so the same command line works on both. The Inductor int64 assert
-that forced `torch.compile` off on the preview image does not fire on the release, so
-compile is on (≈28 s at boot); graphs stay PIECEWISE for the reason in
-[Three GB10 bugs](#three-gb10-bugs-this-works-around).
-
-**Measured** (GX10, hybrid, default recipe: deterministic top-k, reduced draft vocabulary,
-`MADV_RANDOM`, prefix caching, MTP=2, YaRN 500k, `GPU_MEM=0.80`):
-
-| | preview image | v0.29 base |
-|---|---|---|
-| KV pool | 565k–630k tokens (the same recipe, boot to boot: the profiler's headroom depends on the page-cache state) | 575,757–578,787 tokens (two boots) |
-| Determinism (4 prompts × repeats, temperature 0) | 4/4 | 4/4 |
-| Decode, single stream, median of 6 | ~37 tok/s | 36.4 tok/s (33.8–41.5) |
-| Prefill warm, 8k / 32k | ~2,500–3,000 tok/s | 2,529 / 3,026 tok/s |
-| Prefill cold table region, 8k / 32k (×3, salted prompts) | | 2,504–2,513 / 2,444–2,448 tok/s |
-| Needle at 92,157 tokens | ~45 s | found, 45.4 s |
-| MTP draft acceptance (65,536-id vocabulary) | ~68% | 64.8% (8 samples) |
-| Tournament, 17 scenarios × 3, temperature 0.2 | 45/51 @ 38.5 tok/s | run 1: 42.5/51 @ 39.2 (two `length` finishes, one partial); run 2: **45/51 @ 38.7**, 0 errors, no runaways |
-
-Run 2 fails exactly the scenarios the preview image fails (`b6_reconcile`,
-`c5_inventory_reconcile`, which every quantization we tried fails). Run 1's deficit is two
-reasoning runaways that hit the token cap, which we see in roughly one run in three on any
-configuration; it is the day-to-day variance of this benchmark, not a property of the base.
-Verdict: parity in quality, speed and KV pool, and −3 points of draft acceptance that we have
-not investigated. The preview `Dockerfile` stays the default and our production image for
-now; `Dockerfile.v0.29` is the tested path onto the release line, and will become the
-default once fp8 KV is ported and it has run in production for a while.
-
-## NVIDIA's NVFP4 checkpoint: block-fp8 MTP experts under a mixed-precision config (patch 11, temporary)
-
-`nvidia/Qwen3.8-Flash-Next-NVFP4` declares `quant_algo: MIXED_PRECISION` with a per-layer map:
-the routed experts are NVFP4 (as in RadixArk), the PLE table is FP8, and the MTP drafter's
-experts are **`FP8_BLOCK_SCALES`, group 128** — fp8 `weight` + fp32 `weight_scale_inv` per
-128×128 block, the DeepSeek-V3 layout — where RadixArk keeps them in bf16.
-
-vLLM 0.29's `ModelOptMixedPrecisionConfig` resolves per-layer algorithms but only maps FP8,
-FP8_PB_WO, NVFP4, W4A16_NVFP4 and MXFP8 to methods. Two things go wrong for the drafter: the
-map's key is `mtp.layers.0.mlp.experts` while vLLM builds the layer as
-`mtp.layers.<num_hidden_layers>.mlp.experts` (the model remaps `exclude_modules` for that
-offset but not `quantized_layers`), and even with the name matched there is no method for the
-algorithm. The layer is created unquantized (bf16 parameters) and weight loading dies with
-`Layer mtp.layers.48.mlp.experts has no parameter 'w2_weight_scale_inv'`.
-
-`src/vllm_modelopt_block_moe.py`, the shim the preview image still uses, fixes both at the layer:
-it hooks `RoutedExperts._get_quant_method`, reads `quantized_layers` from the served checkpoint,
-matches the drafter's entry by its tail (`.mlp.experts`) under either spelling of the index,
-and returns vLLM's own `Fp8MoEMethod` with `Fp8Config(weight_block_size=[128, 128])` — the
-same method DeepSeek-V3 checkpoints use. (A first version hooked the config class only; in
-practice the expert layer never reached it, hence the layer-level hook.) On the v0.29 base,
-before the backport below replaced it there, vLLM picked the DeepGEMM fp8 MoE backend for it on
-GB10 and it works: drafter acceptance 83–89%, decode 27.7 tok/s on the published layout and
-34.0 on the hybrid, deterministic, needle 6/6 to 413k. The shim is inert for checkpoints without
-`FP8_BLOCK_SCALES` layers, and `VLLM_MODELOPT_BLOCK_MOE=0` disables it.
-
-**On the preview image this shim is still a stopgap, not the fix.** The proper fix landed upstream
-as vllm#55513 (merged 2026-09-08, after the 0.29 release, and not yet in a release): a
-`quantized_layers` remap in the MTP and a block-fp8 MoE branch in the mixed config, at the source of
-both gaps. The v0.29 image carries a backport of it instead of the shim (patch 11 on that base,
-`src/patch_block_fp8_mtp.py`, by @techfury90, with a CPU test; see
-[the v0.29 port](#the-vllm-v0290-port-dockerfilev029)), and the shim is removed there. With the index
-remapped where it goes wrong, the expert layer reaches the config's method, so that base needs no
-layer-level hook.
-
-The hybrid layout needed one more change: `vllm_fp8_hybrid_modelopt.py` used to patch only
-`ModelOptNvFp4Config`; on the mixed config the fp8-converted side layers were caught by the
-checkpoint's exclude list and sent to the bf16 path. It now patches both classes.
-
+Measured on our GX10 (NVIDIA checkpoint, hybrid, MTP=2, YaRN, `GPU_MEM=0.80`): at `CTX=1000000` a
+1,039k-token pool, needles found at 196k, 413k, 635k and 931k tokens; decode −4%, prefill −3 to
+−17%. At 500k context the tournament scored 88.4% over 3 runs, bf16 87.8%. vLLM raises the attention
+block to 3,184 tokens in this mode to keep attention and Mamba pages equal, so prefix-cache hits are
+twice as coarse. The fp8 saving applies to the attention K/V only: the GDN/PLE recurrent states, the
+QSA compressed keys and the raw-key ring stay as they are.

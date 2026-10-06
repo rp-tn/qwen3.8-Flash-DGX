@@ -1,22 +1,18 @@
-diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
-index 4799604..164aa55 100644
 --- a/vllm/parser/engine/parser_engine_config.py
 +++ b/vllm/parser/engine/parser_engine_config.py
-@@ -100,6 +100,9 @@ class ParserEngineConfig:
+@@ -103,6 +103,9 @@
      # Reject tool calls whose names are absent from the request tools.
      validate_tool_names: bool = False
  
 +    # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
 +    validate_tool_preamble: bool = False
 +
-     @cached_property
-     def terminal_defs(self):
-         from vllm.parser.engine.incremental_lexer import terminals_from_literals
-diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
-index ec21b05..d42f57e 100644
+     def terminal_literal(self, name: str) -> str | None:
+         """Canonical spelling of terminal *name*, or ``None`` if undeclared."""
+         value = self.terminals.get(name)
 --- a/vllm/parser/engine/streaming_parser_engine.py
 +++ b/vllm/parser/engine/streaming_parser_engine.py
-@@ -207,6 +207,9 @@ class StreamingParserEngine:
+@@ -212,6 +212,9 @@
          self._message_header_buffer = ""
          self._message_header_token_count = 0
          self._in_skipped_tool_span = False
@@ -26,7 +22,7 @@ index ec21b05..d42f57e 100644
          self._reset_args_state()
  
      def feed(
-@@ -284,6 +287,8 @@ class StreamingParserEngine:
+@@ -289,6 +292,8 @@
  
          events.extend(self._process_lex_tokens(self._lexer.flush()))
  
@@ -35,8 +31,8 @@ index ec21b05..d42f57e 100644
          if self._args_buffer:
              events.append(
                  SemanticEvent(
-@@ -359,8 +364,28 @@ class StreamingParserEngine:
-     )
+@@ -395,8 +400,28 @@
+         return markers
  
      def _on_terminal(
 -        self, terminal: str, value: str, token_count: int = 0
@@ -65,8 +61,8 @@ index ec21b05..d42f57e 100644
          key = (self.state, terminal)
          transition = self.config.transitions.get(key)
  
-@@ -372,6 +397,15 @@ class StreamingParserEngine:
-                 self._in_skipped_tool_span = False
+@@ -411,6 +436,15 @@
+         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
              return self._emit_for_state(value, token_count)
  
 +        if (
@@ -81,7 +77,7 @@ index ec21b05..d42f57e 100644
          if self.skip_tool_parsing and terminal in self._tool_terminals:
              # Inkling reuses one terminal for tool, text, and reasoning exits.
              # Outside a forwarded tool span, apply its normal transition.
-@@ -430,6 +464,26 @@ class StreamingParserEngine:
+@@ -469,6 +503,26 @@
          return self._apply_transition(transition, value, token_count)
  
      def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
@@ -108,7 +104,7 @@ index ec21b05..d42f57e 100644
          if self.state == ParserState.MESSAGE_HEADER:
              self._message_header_buffer += text
              self._message_header_token_count += token_count
-@@ -457,6 +511,30 @@ class StreamingParserEngine:
+@@ -496,6 +550,30 @@
              ]
          return []
  
@@ -139,21 +135,19 @@ index ec21b05..d42f57e 100644
      def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
          if not text:
              return []
-diff --git a/vllm/parser/nemotron_v3.py b/vllm/parser/nemotron_v3.py
-index c8b75a2..2141c98 100644
 --- a/vllm/parser/nemotron_v3.py
 +++ b/vllm/parser/nemotron_v3.py
-@@ -37,4 +37,5 @@ def nemotron_v3_config(thinking: bool = True) -> ParserEngineConfig:
+@@ -35,6 +35,7 @@
+     return dataclasses.replace(
+         qwen3_config(thinking=thinking, turn_boundary_tokens=CHATML_TURN_BOUNDARIES),
          name="nemotron_v3",
 +        validate_tool_preamble=False,
          strip_trailing_reasoning_whitespace=True,
      )
  
-diff --git a/vllm/parser/qwen3.py b/vllm/parser/qwen3.py
-index 8edf42e..fd40925 100644
 --- a/vllm/parser/qwen3.py
 +++ b/vllm/parser/qwen3.py
-@@ -198,6 +198,7 @@ def qwen3_config(
+@@ -199,6 +199,7 @@
          stream_arg_deltas=True,
          strip_trailing_reasoning_whitespace=False,
          tool_args_json=False,

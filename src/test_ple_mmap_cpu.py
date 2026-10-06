@@ -1,7 +1,7 @@
 """CPU unit test for vllm_ple_mmap: synthetic FP8 shards -> gather == reference.
 
 Run inside the vLLM image (needs numpy + torch, no GPU):
-  docker run --rm -v $PWD:/t -w /t --entrypoint python3 vllm/vllm-openai:qwen38-flash-next test_ple_mmap_cpu.py
+  docker run --rm -v $PWD:/t -w /t --entrypoint python3 vllm/vllm-openai:v0.30.0 test_ple_mmap_cpu.py
 """
 import json
 import logging

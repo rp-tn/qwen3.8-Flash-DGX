@@ -1,46 +1,25 @@
-# Qwen3.8-Flash-Next on a single DGX Spark / GB10, via vLLM.
+# Qwen3.8-Flash-Next on a DGX Spark — the official vLLM v0.30.0 image plus these patches:
+#   1 PLE mmap, 2 GB10 FLA fixes, 4 prefix-caching block_size fix, 5 exact top-k, 6 hybrid mode,
+#   7 fp8 KV cache, 8 deterministic top-k kernel, 10 reduced draft vocabulary, 12 Qwen tool preamble fix,
+#   13 quoted Qwen tool markers stay text, 14 MoE weight-load clone (#33), 15-18 the rest of weight
+#   loading (pread, expert-name index, chunked embedding copy, MTP name prefilter).
+# The gaps in the numbering are fixes that are now upstream: 3 (vllm#50729), 9 (vllm#52775) and
+# 11 (vllm#55513). The older preview and v0.29 bases are at the git tag multi-base-final.
 #
-# Starts from the official Qwen3.8-Flash-Next vLLM image and layers a handful of
-# patches on it. Performance options are gated by runtime flags; correctness
-# fixes are enabled as listed below:
-#
-#   1. PLE table served from disk via mmap            (VLLM_PLE_MMAP=1)      — the one that makes it fit
-#   2. GB10 FLA fixes                                  (always on, harmless elsewhere)
-#   3. Mamba state-copy race fix + bounds guard        (always on)
-#   4. Prefix-caching block_size fix                   (always on; needed for --enable-prefix-caching)
-#   5. Exact, deterministic QSA top-k                  (VLLM_QSA_EXACT_TOPK=1)
-#   6. NVFP4 experts + fp8 side-layers "hybrid" mode   (VLLM_FP8_HYBRID=1)
-#   7. fp8_e4m3 KV cache on the QSA path              (--kv-cache-dtype fp8_e4m3)
-#   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
-#   9. M%4 padding for the blockwise-fp8 GEMM         (VLLM_FP8_PAD_M4=1)   — hybrid mode with prefix caching OFF
-#  10. Reduced draft vocabulary for the MTP drafter    (VLLM_MTP_DRAFT_VOCAB=<ids.npy>) — +20% decode, same tournament score
-#  11. ModelOpt mixed-precision block-FP8 experts     (VLLM_MODELOPT_BLOCK_MOE=0 disables)
-#  12. Lossless malformed Qwen tool preambles        (always on for the qwen3 parser)
-#  13. Quoted tool markers stay text, not calls     (always on for the qwen3 parser)
-#
-#   docker build -t qwen38-flash-dgx .
-#
-# The base image is multi-arch (arm64 for the Spark's Grace CPU). Pinned by digest
-# for reproducibility; bump the tag below if the upstream recipe moves.
-FROM vllm/vllm-openai:qwen38-flash-next@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
-LABEL qwen38.base=preview
-
-# Package layout inside the official image (vLLM 0.1.dev20073, torch 2.13 cu130,
-# numpy 2.2.6 — the patch needs numpy, already present).
+#   docker build -t qwen38-flash-dgx:v0.30 .      # ./flash setup does this for you
+FROM vllm/vllm-openai:v0.30.0
+LABEL qwen38.base=v0.30
 ARG SP=/usr/local/lib/python3.12/dist-packages
-ARG PLE=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+ARG PKG=${SP}/vllm/models/qwen4_exp/nvidia
+ARG PLE=${PKG}/ngram_embedding.py
 
-# --- 1. PLE n-gram table from disk ------------------------------------------------
+# --- 1. PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---
 COPY src/vllm_ple_mmap.py ${SP}/vllm_ple_mmap.py
 RUN cp ${PLE} ${PLE}.orig \
- && printf '\n\n# --- qwen38-flash-dgx: serve the PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---\nfrom vllm_ple_mmap import apply as _ple_mmap_apply\n_ple_mmap_apply(Qwen3_8FlashNextNGramEmbedding)\n' >> ${PLE} \
- && python3 -c "import ast; ast.parse(open('${PLE}').read()); print('ple_layer.py patched OK')"
+ && printf '\n\n# --- qwen38-flash-dgx: serve the PLE n-gram table from disk (VLLM_PLE_MMAP=1) ---\nfrom vllm_ple_mmap import apply as _ple_mmap_apply\n_ple_mmap_apply(Qwen4ExpNGramEmbedding)\n' >> ${PLE} \
+ && python3 -c "import ast; ast.parse(open('${PLE}').read()); print('ngram_embedding.py patched OK')"
 
-# --- 2. GB10 FLA fixes, contributed by @Saren-Arterius ----------------------------
-#     (https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound)
-# 1) sm_121 reports 99 KiB of shared memory per block; the flash-linear-attention
-#    gate asks for 100 KiB, so all 36 GDN layers silently fell back to small tiles.
-# 2) fla#953: tl.dot race on Blackwell with num_warps=4 in chunk_delta_h -> pin 2.
+# --- 2. GB10 FLA fixes (@Saren-Arterius) ---
 ARG FLA_UTILS=${SP}/vllm/third_party/flash_linear_attention/ops/utils.py
 ARG FLA_CDH=${SP}/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
 RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, big GDN tiles fit|' ${FLA_UTILS} \
@@ -48,39 +27,17 @@ RUN sed -i 's|DEFAULT = 102400|DEFAULT = 101376  # spark-fla-shmem: GB10 99KiB, 
  && sed -i 's|for num_warps in \[2, 4\]|for num_warps in [2]  # spark-fla-warps: fla#953 Blackwell tl.dot race|' ${FLA_CDH} \
  && grep -q "spark-fla-warps" ${FLA_CDH} && echo "fla num_warps pinned"
 
-# --- 3. Mamba state copy: vllm#50729 + bounds guard --------------------------------
-# src/mamba_utils_guarded.py = vLLM's v1/worker/mamba_utils.py with
-#   - vllm#50729 "[Bugfix][Mamba] Fix overlapping state copy race" (@AndreasKaratzas), and
-#   - a bounds guard by @Saren-Arterius: a state copy with an out-of-range block id is
-#     skipped and counted ("mamba state-copy guard: N out-of-range ...") instead of
-#     taking down the CUDA context with an illegal memory access.
-ARG MU=${SP}/vllm/v1/worker/mamba_utils.py
-RUN cp ${MU} ${MU}.orig
-COPY src/mamba_utils_guarded.py ${MU}
-RUN python3 -c "import ast; ast.parse(open('${MU}').read()); print('mamba_utils.py guarded OK')"
-
-# --- 4. Prefix caching: block_size fix ----------------------------------------------
-# vLLM's EngineCore overwrites cache_config.block_size with the smallest KV-group block
-# size (here the QSA raw-key ring: 8/16 tokens) while the Mamba block is 1600. Two
-# consumers used the former as the latter, so a prefix hit restored an all-zero Mamba
-# state. See docs/HOW-IT-WORKS.md. With this, --enable-prefix-caching is correct.
+# --- 4. Prefix caching: block_size fix (still needed on v0.30: core.py takes the min group block) ---
 COPY src/patch_mamba_block_size.py /tmp/patch_mamba_block_size.py
 RUN python3 /tmp/patch_mamba_block_size.py ${SP} && rm /tmp/patch_mamba_block_size.py
 
-# --- 5. Exact QSA top-k (VLLM_QSA_EXACT_TOPK=1) ---------------------------------------
-# The stock persistent_topk kernel is non-deterministic on GB10 and can drop real
-# top-k candidates (vllm#51782; reported here by @k3dani, issue #3). The exact path
-# uses torch.topk over the visible columns. Opt-in; scripts/serve.sh enables it.
+# --- 5. Exact QSA top-k fallback (VLLM_QSA_EXACT_TOPK=1) ---
 COPY src/patch_qsa_exact_topk.py /tmp/patch_qsa_exact_topk.py
-RUN python3 /tmp/patch_qsa_exact_topk.py ${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py && rm /tmp/patch_qsa_exact_topk.py
+RUN python3 /tmp/patch_qsa_exact_topk.py ${PKG}/ops/qsa_indexer.py && rm /tmp/patch_qsa_exact_topk.py
 
-# --- 6. Hybrid mode: NVFP4 experts + blockwise-fp8 side layers (VLLM_FP8_HYBRID=1) ----
-# Lets the GDN in/out projections, QSA q/k/v/o and shared experts be stored as
-# blockwise fp8 (DeepSeek layout, produced by tools/fp8_convert.py) while the MoE
-# experts stay NVFP4. Port of @Saren-Arterius's int4+fp8 dispatch to ModelOpt-NVFP4.
-# No-op unless VLLM_FP8_HYBRID=1 (and harmless on a plain NVFP4 checkpoint).
+# --- 6. Hybrid mode: NVFP4 experts + blockwise-fp8 side layers (VLLM_FP8_HYBRID=1) ---
 ARG MO=${SP}/vllm/model_executor/layers/quantization/modelopt.py
-ARG QSA=${SP}/vllm/models/qwen3_8_flash_next/nvidia/qsa.py
+ARG QSA=${PKG}/qsa.py
 COPY src/vllm_fp8_hybrid_modelopt.py ${SP}/vllm_fp8_hybrid_modelopt.py
 RUN cp ${MO} ${MO}.orig \
  && printf '\n\n# --- qwen38-flash-dgx: NVFP4 + blockwise-fp8 side layers (VLLM_FP8_HYBRID=1) ---\nfrom vllm_fp8_hybrid_modelopt import apply as _fp8_hybrid_apply\n_fp8_hybrid_apply()\n' >> ${MO} \
@@ -91,82 +48,62 @@ RUN cp ${MO} ${MO}.orig \
  && grep -q "_fp8_hybrid_excluded(quant_config)" ${QSA} && grep -q "^from vllm_fp8_hybrid_modelopt import" ${QSA} \
  && python3 -c "import ast; ast.parse(open('${QSA}').read()); print('qsa.py hooked OK')"
 
-# --- 7. fp8_e4m3 KV cache on the QSA path (--kv-cache-dtype fp8_e4m3) ------------------
-# Contributed by @Nanetnounou (issue #6, vllm#54426). Dequantizes on the read side of the
-# QSA Triton kernels (main KV and the indexer's raw-key ring), relaxes the bf16-only guards.
-# Inert with --kv-cache-dtype auto (the Triton branch is compiled out). ~1.9x KV pool,
-# 1M context on one box, at a speed and quality cost — see README before using it.
+# --- 7. fp8_e4m3 main KV cache on the QSA path (--kv-cache-dtype fp8_e4m3; KV_DTYPE=fp8_e4m3) ---
+# After @Nanetnounou's original (issue #6): dequantize on the read side of the split-K kernel with
+# vLLM's _cast_kv_tile and the layer's real scales, widen the guards.
+# The indexer caches are left to v0.30 (raw keys bf16, compressed keys with their own dtype knob).
+# Inert with --kv-cache-dtype auto (the Triton branch is compiled out).
 COPY src/patch_qsa_fp8_kv.py /tmp/patch_qsa_fp8_kv.py
 RUN python3 /tmp/patch_qsa_fp8_kv.py ${SP} && rm /tmp/patch_qsa_fp8_kv.py
 
-# --- 8. Deterministic persistent_topk kernel (VLLM_QSA_DET_TOPK=1) -----------------------
-# Kernel-side fix for the non-deterministic / candidate-dropping QSA top-k (issue #3, vllm#51782):
-# @jschmied's deterministic persistent_topk, upstream as vllm#55122, built here as a standalone
-# extension (_C_det.so) with the image's nvcc — no vLLM rebuild. Same determinism as patch 5's
-# exact torch.topk, but at kernel speed: on the GX10 it recovers the whole prefill penalty
-# (8k: 1,476 -> 2,488 tok/s; 32k: 1,794 -> 2,996; needle 92k: 69 s -> 46 s) with decode unchanged.
-# Sources are fetched from https://github.com/jschmied/qwen38-flash-next-gb10 at a pinned commit
-# (Apache-2.0; attribution: @jschmied). Set DET_ARCH=120a for
-# an x86 Blackwell (RTX 5090). Inert unless VLLM_QSA_DET_TOPK=1; VLLM_QSA_EXACT_TOPK=1 still wins.
+# --- 8. Deterministic persistent_topk kernel (@jschmied, vllm#55122), built with the image's nvcc ---
+# v0.30 changed the stock kernel (vllm#54110 low-smem fallback, vllm#56346 sampled filtering): whether GB10
+# still needs this one is re-measured by scripts/smoke-test.sh (determinism) on every boot.
 ARG KDET_SHA=e0ef69d4f5575dad00d34e05479eaf4c6547bace
 ARG KDET=https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KDET_SHA}
 ARG DET_ARCH=121a
-# Pinned by commit AND sha256 (ADD --checksum needs BuildKit, the default since Docker 23).
 ADD --checksum=sha256:138cacfc5eb117f0922d53c88727e4d0dc26dcfb246c3d401fc280cfc726cc71 ${KDET}/patches/kernel-det/build_det.py /opt/llm/kernel-det/src/build_det.py
 ADD --checksum=sha256:b103fbeaf7589b9468471142ad0b30012a076f93d20ba11fc5ff6dcb1ecd32a6 ${KDET}/patches/kernel-det/bindings_det.cpp /opt/llm/kernel-det/src/bindings_det.cpp
 ADD --checksum=sha256:19e1d53425ea9a839445722fd1dac1c41727128eebdce84508c1bfb8592afecf ${KDET}/patches/kernel-det/topk_det.cu /opt/llm/kernel-det/src/topk_det.cu
 ADD --checksum=sha256:16939700ae389750782ff5c0d5b9caef59aa0ff8b869b64ec94fa72c814910ee ${KDET}/patches/kernel-det/torch_utils.h /opt/llm/kernel-det/src/torch_utils.h
 ADD --checksum=sha256:b4ef9ce298d43d6c0e6db9fcca451df20815b2cfe33791919c1ad9c0e84f0ba7 ${KDET}/patches/kernel-det/persistent_topk.cuh /opt/llm/kernel-det/src/persistent_topk.cuh
-ADD --checksum=sha256:70905073fe3fa361030bf1cb469b74610766bdfe361419cd7df50af2561322e3 ${KDET}/tools/determinism/qsadet_patch.py /tmp/qsadet_patch.py
+COPY src/patch_qsadet.py /tmp/patch_qsadet.py
 RUN cd /opt/llm/kernel-det/src && DET_BUILD_DIR=/opt/llm/kernel-det/build DET_ARCH=${DET_ARCH} python3 build_det.py 2>&1 | tail -2 \
  && cp /opt/llm/kernel-det/build/_C_det.so /opt/llm/kernel-det/_C_det.so \
- && VLLM_QSA_PY=${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py python3 /tmp/qsadet_patch.py && rm /tmp/qsadet_patch.py \
- && python3 -c "import ast; ast.parse(open('${SP}/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py').read()); print('qsadet wired OK')"
+ && python3 /tmp/patch_qsadet.py ${PKG}/ops/qsa_indexer.py && rm /tmp/patch_qsadet.py \
+ && python3 -c "import ast; ast.parse(open('${PKG}/ops/qsa_indexer.py').read()); print('qsadet wired OK')"
 
-# --- 9. M%4 padding for the sm_12x blockwise-FP8 GEMM (VLLM_FP8_PAD_M4=1, opt-in) --------
-# The preview image's cutlass blockwise-fp8 dispatch routes any GEMM whose row count M is not a
-# multiple of 4 (or <= 64) to a swap_ab path: ~1.7x slower below 2,048 rows, ~10x above (measured
-# on a GX10; fixed upstream in C++ by vllm#52775, after this image was cut). Only the hybrid mode's
-# fp8 side layers use this GEMM. @jschmied's drop-in pads M to a multiple of 4 inside an opaque
-# custom op (issue #3). With --enable-prefix-caching (our default) prefill chunks are already
-# clipped to the 1,600-token Mamba block, so M % 4 == 0 and the patch is a no-op: OFF by default.
-# With PREFIX_CACHE=0 in hybrid mode it is worth about -40% TTFT at 8k. Fetched at a pinned commit
-# (Apache-2.0; attribution: @jschmied). NOTE: the patch itself
-# defaults to ON on sm_12x when the env var is unset, so scripts/serve.sh always sets it explicitly.
-ARG KM4_SHA=d9705bde5a5b294478a5baf82b888a64000a16ef
-ADD --checksum=sha256:deb7b7865c84ab9921e1f8e7d5c60d366910092a7888f8f570ddf5d35d83eff8 https://raw.githubusercontent.com/jschmied/qwen38-flash-next-gb10/${KM4_SHA}/tools/main/fp8_m4pad_patch.py /tmp/fp8_m4pad_patch.py
-RUN python3 /tmp/fp8_m4pad_patch.py && rm /tmp/fp8_m4pad_patch.py \
- && python3 -c "import ast; p='${SP}/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py'; s=open(p).read(); ast.parse(s); assert 'fp8m4pad::scaled_mm_padded' in s; print('fp8 m4pad wired OK')"
-
-# --- 10. Reduced draft vocabulary for the MTP drafter (VLLM_MTP_DRAFT_VOCAB, opt-in per env) ----
-# vLLM shares the target's lm_head with the MTP draft, so every draft step scores all 248,320
-# vocabulary rows (a 1.27 GiB bf16 read per drafted token) on a bandwidth-bound decode step.
-# With VLLM_MTP_DRAFT_VOCAB=<ids.npy> the draft scores a private 65,536-row slice of the head
-# (+320 MiB) and every other id gets -inf; the target still verifies every token, so outputs are
-# unchanged and only the acceptance rate can move. Measured on the GX10 (hybrid, MTP=2): decode
-# 33.1 -> 36.6-38.5 tok/s, acceptance 75 -> 68%, tournament 45/51 (same as without). The id set
-# = the 65,536 most frequent tokens (corpus + BPE order) plus every special/added token; rebuild
-# it for another language mix with tools/build_draft_vocab.py. Idea from MiaAI-Lab's recipe
-# (independent reimplementation). scripts/serve.sh enables it by default (DRAFT_VOCAB=1).
+# --- 10. Reduced draft vocabulary for the MTP drafter (VLLM_MTP_DRAFT_VOCAB) ---
 COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
 COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
-RUN python3 /tmp/patch_mtp_draft_vocab.py ${SP}/vllm/models/qwen3_8_flash_next/nvidia/mtp.py && rm /tmp/patch_mtp_draft_vocab.py
-
-# --- 11. FP8_BLOCK_SCALES layers in ModelOpt MIXED_PRECISION checkpoints (NVIDIA's own NVFP4 checkpoint
-#        quantizes the MTP experts that way; vLLM's mixed-precision config does not know the algo) ---
-COPY src/vllm_modelopt_block_moe.py ${SP}/vllm_modelopt_block_moe.py
-RUN printf '\n\n# --- qwen38-flash-dgx: FP8_BLOCK_SCALES support for ModelOpt MIXED_PRECISION (VLLM_MODELOPT_BLOCK_MOE=0 disables) ---\nfrom vllm_modelopt_block_moe import apply as _block_moe_apply\n_block_moe_apply()\n' >> ${MO} \
- && python3 -c "import ast; ast.parse(open('${MO}').read()); print('modelopt.py block-moe hooked OK')"
+RUN python3 /tmp/patch_mtp_draft_vocab.py ${PKG}/mtp.py && rm /tmp/patch_mtp_draft_vocab.py
 
 # --- 12. Preserve quoted/malformed Qwen tool markers in reasoning and content ---
-# Confirm a tool preamble before switching output channels. Shared by both bases.
+# Confirm a tool preamble before switching output channels.
 COPY src/patches/qwen-tool-preamble.patch /tmp/qwen-tool-preamble.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-preamble.patch \
  && rm /tmp/qwen-tool-preamble.patch
 
 # --- 13. Quoted Qwen tool markers the model is documenting, not calling ---
 # A marker inside a fenced code block, or a wrapper-less <function= header mid-line,
-# stays text and opens no tool call. Shared by both bases; needs 12 applied first.
+# stays text and opens no tool call. Needs 12 applied first.
 COPY src/patches/qwen-tool-marker-guard.patch /tmp/qwen-tool-marker-guard.patch
 RUN cd ${SP} && patch --batch --forward --fuzz=0 -p1 < /tmp/qwen-tool-marker-guard.patch \
  && rm /tmp/qwen-tool-marker-guard.patch
+
+# --- 14. MoE weight loading: clone the mmap view before the H2D copy (VLLM_LOAD_CLONE=0 disables) ---
+# PR #33 (@Willian-Zhang): the two call sites in routed_experts.py; byte-identical weights.
+COPY src/patch_moe_load_clone.py /tmp/patch_moe_load_clone.py
+RUN python3 /tmp/patch_moe_load_clone.py ${SP} && rm /tmp/patch_moe_load_clone.py
+
+# --- 15-18. The rest of weight loading (docs/HOW-IT-WORKS.md, "The rest of weight loading") ---
+# 15: pread tensors <= 64 MiB into ordinary memory, not mmap views; never the PLE table (needs 14).
+# 16: indexed expert-name matching instead of substring-testing 1,536 entries per tensor.
+# 17: embed_tokens / lm_head copied to the GPU in 64 MiB pieces via ordinary memory.
+# 18: the MTP drafter skips non-MTP tensors by name before they are read.
+COPY src/patch_load_pread.py src/patch_moe_name_index.py src/patch_embed_chunked_copy.py \
+     src/patch_mtp_name_prefilter.py /tmp/
+RUN python3 /tmp/patch_load_pread.py ${SP} && python3 /tmp/patch_moe_name_index.py ${SP} \
+ && python3 /tmp/patch_embed_chunked_copy.py ${SP} && python3 /tmp/patch_mtp_name_prefilter.py ${SP} \
+ && rm /tmp/patch_load_pread.py /tmp/patch_moe_name_index.py /tmp/patch_embed_chunked_copy.py \
+       /tmp/patch_mtp_name_prefilter.py

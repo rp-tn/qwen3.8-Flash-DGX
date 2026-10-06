@@ -20,8 +20,6 @@
 #   DET_TOPK=1        1 = deterministic QSA top-k KERNEL (@jschmied, vllm#55122): identical output at
 #                     temperature 0 at no prefill cost. The default.
 #   EXACT_TOPK=0      1 = exact torch.topk fallback (also deterministic, but -20-40% long prefill); wins over DET_TOPK
-#   PAD_M4=0          1 = pad M%4 in the blockwise-fp8 GEMM (@jschmied). Hybrid mode only; a no-op with
-#                     PREFIX_CACHE=1 (chunks are 1600-aligned), about -40% TTFT at 8k with PREFIX_CACHE=0
 #   DRAFT_VOCAB=1     1 = the MTP drafter scores only the 65,536 most frequent tokens (+20% decode, same
 #                     tournament score); 0 = full vocabulary; a path = your own ids.npy (tools/build_draft_vocab.py)
 #   MADVISE=random    madvise on the mmapped PLE table: random (default; no readahead, cleaner page cache) or normal
@@ -30,8 +28,9 @@
 #                     overlap (+8% decode at 1 stream, +17% aggregate at 4, README); 512 = old inline path
 #   EFFORT_ALIAS=1    1 = accept reasoning_effort high/max (-> xhigh) and minimal (-> low): the checkpoint's
 #                     template only takes xhigh/medium/low and 400s the rest, including Claude Code's "high"
-#   LOG_REQUESTS=0    1 = log every prompt and output (VLLM_LOGGING_LEVEL=DEBUG, --enable-log-requests
-#                     --enable-log-outputs) for tools/vllm_watch.py. Debugging only: privacy + unbounded logs
+#   LOG_REQUESTS=0    1 = log every prompt and output (--enable-log-requests --enable-log-outputs, DEBUG on
+#                     vLLM's request logger only) for tools/vllm_watch.py. Debugging only: privacy + unbounded logs
+#   SERVED_MODEL_NAME=qwen3.8-flash-next   model name exposed by the OpenAI-compatible API
 #   PORT=18300        host port for the API
 #   CTX=262144        max context length (native). With YARN=1 up to ~500000 (see README)
 #   YARN=0            1 = YaRN rope scaling (factor 4) for CTX > 262144
@@ -55,24 +54,23 @@
 #                     REALTIME_DIR= (default /home/roger/expert-realtime) mounts rw for the expert_rt
 #                     plugin's real-traffic counters, merged into spark:9102 by expert_exporter.py.
 #                     e.g. PLUGIN_DIR=/home/roger/vllm_stuff/tools/expert_plugin
-#   COMPILE_CACHE=    where to keep vLLM's compiled graphs and FlashInfer's JIT modules across
-#                     boots. Unset (default) = inside the container, which this script recreates
-#                     every time, so they are rebuilt on every boot (80 s of init engine, see
-#                     README). A bare name becomes docker volumes, an absolute path binds dirs
-#   IMAGE=qwen38-flash-dgx   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
-#   BASE=             preview|v0.29 — normally read from the image label (Dockerfile vs Dockerfile.v0.29).
-#                     On v0.29: KV_DTYPE must stay auto (fp8 KV not ported), PAD_M4 is a no-op.
+#   COMPILE_CACHE=    where to keep vLLM's and FlashInfer's caches, Triton's kernels and the CUDA
+#                     driver's JIT cache across boots. Unset (default) = inside the container,
+#                     which this script recreates every time, so they are rebuilt on every boot
+#                     (~37 s of startup, see README). A bare name becomes docker volumes, an
+#                     absolute path binds dirs
+#   IMAGE=qwen38-flash-dgx:v0.30   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4   (RadixArk/Qwen3.8-Flash-Next-NVFP4 still supported: MODEL=...)
 set -euo pipefail
 
 NAME="${NAME:-qwen38-flash}"
-IMAGE="${IMAGE:-qwen38-flash-dgx}"
+IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
 MODEL="${MODEL:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # default since 2026-09-14; see README "Checkpoints"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-flash-next}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 MODE="${MODE:-nvfp4}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
 DET_TOPK="${DET_TOPK:-1}"
 EXACT_TOPK="${EXACT_TOPK:-0}"
-PAD_M4="${PAD_M4:-0}"
 DRAFT_VOCAB="${DRAFT_VOCAB:-1}"
 MADVISE="${MADVISE:-random}"
 FAST_ROWS="${FAST_ROWS:-0}"
@@ -185,25 +183,19 @@ if [ "$EFFORT_ALIAS" = 1 ]; then
   fi
 fi
 
-# The PLE gather is a CPU op + a pageable host->device copy: it MUST run outside
-# CUDA graphs. We declare it a splitting op and use PIECEWISE capture (never FULL*).
-# The splitting-op names depend on the base image: the preview names the model qwen3_8_flash_next and
-# our PLE op is ple_mmap_lookup; vLLM >= 0.29 names it qwen4_exp and the op is ple_mmap_lookup_ids.
-# Both Dockerfiles stamp a label so this picks the right list (BASE=preview|v0.29 overrides).
-BASE="${BASE:-$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)}"
-if [ "$BASE" = "v0.29" ]; then
-  SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen4_exp_compute_ple_ngram_ids","vllm::qwen4_exp_ple_short_conv","vllm::qwen4_exp_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup_ids"]'
-else
-  SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen3_8_flash_next_ple_short_conv","vllm::qwen3_8_flash_next_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::sparse_attn_indexer","vllm::ple_mmap_lookup"]'
+# The image must be a build of this repo's Dockerfile (LABEL qwen38.base=v0.30). An older preview or
+# v0.29 build under the same name has different op names and patches: refuse it rather than half-work.
+BASE="$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$IMAGE" 2>/dev/null || true)"
+if [ "$BASE" != "v0.30" ]; then
+  echo "!! $IMAGE is ${BASE:+a '$BASE'-base build, }${BASE:-missing or unlabeled}; this recipe needs the v0.30 image: docker build -t $IMAGE .  (or ./flash setup)"; exit 1
 fi
-# Options the v0.29 image does not carry: patch 7 (fp8 KV on the QSA path) is not ported, and patch 9
-# (M%4 padding) is unnecessary there (vllm#52775 is in the release) so the image has no such kernel.
-if [ "$BASE" = "v0.29" ]; then
-  if [ "$KV_DTYPE" != auto ]; then
-    echo "!! KV_DTYPE=$KV_DTYPE: the fp8 KV cache patch is not ported to the v0.29 base yet — use the preview image (Dockerfile) for fp8 KV"; exit 1
-  fi
-  [ "$PAD_M4" != 0 ] && echo "!! PAD_M4 has no effect on the v0.29 base (vllm#52775 fixed the fp8 GEMM there); ignoring" && PAD_M4=0
-fi
+
+# The PLE gather is a CPU op + a pageable host->device copy: it MUST run outside CUDA graphs.
+# On v0.30 the piecewise graphs are breakable captures and the gather ends a segment by itself
+# (src/vllm_ple_mmap.py); the splitting-op list below only matters on the torch.compile/FX path
+# (VLLM_USE_BREAKABLE_CUDAGRAPH=0). It is v0.30's default list (CompilationConfig._attention_ops)
+# + the two kv_cache_update ops vLLM appends when the list is left unset + our PLE gather.
+SPLIT='["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::qwen4_exp_ple_short_conv","vllm::qwen4_exp_qsa_with_output","vllm::linear_attention","vllm::qwen_gdn_attention_core","vllm::qwen_gdn_attention_core_fused_norm_packed","vllm::gdn_attention_core_xpu","vllm::olmo_hybrid_gdn_full_forward","vllm::sparse_attn_indexer","vllm::rocm_aiter_sparse_attn_indexer","vllm::deepseek_v4_attention","vllm::hpc_rope_norm_forward","vllm::unified_kv_cache_update","vllm::unified_mla_kv_cache_update","vllm::ple_mmap_lookup_ids"]'
 CC="${CC:--cc.cudagraph_mode=PIECEWISE -cc.splitting_ops=$SPLIT}"
 
 # YaRN (Qwen's published recipe) to go past the native 262144.
@@ -235,7 +227,44 @@ DETENV+=(-e VLLM_PLE_MMAP_MADVISE="$MADVISE")
 # The module reads this with a silent fallback to 512 on anything unparsable, so refuse a bad value here.
 case "$FAST_ROWS" in ''|*[!0-9]*) echo "!! FAST_ROWS must be a non-negative integer (0 = thread pool for every gather, 512 = old inline path)"; exit 1 ;; esac
 DETENV+=(-e VLLM_PLE_MMAP_FAST_ROWS="$FAST_ROWS")
-LOGARGS=(); [ "$LOG_REQUESTS" = 1 ] && { DETENV+=(-e VLLM_LOGGING_LEVEL=DEBUG); LOGARGS=(--enable-log-requests --enable-log-outputs); }
+# LOG_REQUESTS=1: vLLM's request logger writes the outputs at INFO but the prompts at DEBUG, and
+# tools/vllm_watch.py reads both. So DEBUG goes to that one logger, through a logging config, and
+# everything else stays at INFO. A global VLLM_LOGGING_LEVEL=DEBUG floods the log and, on v0.30,
+# makes the op dispatcher (vllm/ir/op.py) format tensors during the drafter's CUDA-graph capture,
+# which invalidates it and kills the engine at boot (issue #47).
+LOGARGS=(); LOG_MNT=()
+if [ "$LOG_REQUESTS" = 1 ]; then
+  LOGCFG_HOST=""
+  for d in "$HF_CACHE/qwen38-flash-dgx" "${XDG_CACHE_HOME:-$HOME/.cache}/qwen38-flash-dgx" "$SERVE_ROOT/.cache"; do
+    if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then LOGCFG_HOST="$d/vllm-logging-requests.json"; break; fi
+  done
+  if [ -z "$LOGCFG_HOST" ] || ! cat > "$LOGCFG_HOST" 2>/dev/null <<'JSON'
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "vllm": {
+      "class": "vllm.logging_utils.NewLineFormatter",
+      "datefmt": "%m-%d %H:%M:%S",
+      "format": "%(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s"
+    }
+  },
+  "handlers": {
+    "vllm": {"class": "logging.StreamHandler", "formatter": "vllm", "level": "DEBUG", "stream": "ext://sys.stdout"}
+  },
+  "loggers": {
+    "vllm": {"handlers": ["vllm"], "level": "INFO", "propagate": false},
+    "vllm.entrypoints.serve.utils.request_logger": {"level": "DEBUG"}
+  }
+}
+JSON
+  then
+    echo "!! LOG_REQUESTS: no writable place for the logging config (tried $HF_CACHE/qwen38-flash-dgx, ${XDG_CACHE_HOME:-$HOME/.cache}/qwen38-flash-dgx and $SERVE_ROOT/.cache)"; exit 1
+  fi
+  DETENV+=(-e VLLM_LOGGING_CONFIG_PATH=/qwen38/logging.json)
+  LOG_MNT=(-v "$LOGCFG_HOST:/qwen38/logging.json:ro")
+  LOGARGS=(--enable-log-requests --enable-log-outputs)
+fi
 PC_ARG=--no-enable-prefix-caching
 [ "$PREFIX_CACHE" = 1 ] && PC_ARG=--enable-prefix-caching
 
@@ -246,20 +275,28 @@ PC_ARG=--no-enable-prefix-caching
 # PROMETHEUS_MULTIPROC_DIR here makes /metrics aggregate every vLLM process; the tmpfs
 # is fresh per container, so no stale per-process files survive a restart.
 # Measured against a single-process /metrics: vLLM's own series keep their names and
-# labels, with no per-process pid label; the only loss is the *_created samples, which
-# prometheus_client does not export in multiprocess mode. That is why it is off
-# by default: it changes what existing dashboards see.
+# labels, with no per-process pid label. What is lost: the *_created samples, and the
+# default process_*/python_* collectors (process_start_time_seconds, process_resident_memory_bytes,
+# process_cpu_seconds_total, python_gc_*, python_info), because vLLM serves a fresh registry holding
+# only the multiprocess collector. vllm:ple_mmap_engine_start_time_seconds stands in as a restart
+# marker (issue #36). That is why it is off by default: it changes what existing dashboards see.
 PROM_ARGS=(); [ "$PROM_MULTIPROC" = 1 ] && PROM_ARGS=(--tmpfs /tmp/vllm-prometheus:rw,size=256m -e PROMETHEUS_MULTIPROC_DIR=/tmp/vllm-prometheus)
-# Both are keyed by a hash of the model and the engine config, so one pair is safe to
-# share across profiles: a different recipe lands in a different entry. /root/.triton is
-# deliberately not persisted — measured at 0.2 s, below CUDA-graph capture noise.
+# vllm and flashinfer are keyed by a hash of the model and the engine config, so one set is
+# safe to share across profiles: a different recipe lands in a different entry. Triton keys
+# each kernel by its source, constants and backend; the CUDA driver's PTX JIT cache
+# (/root/.nv) by PTX and driver version. Without these two, init engine JIT-compiles ~140
+# Triton kernels and the vision tower's sm80 PTX on every boot (~26 s, see README).
 CACHE_MNT=()
 case "$COMPILE_CACHE" in
   "") ;;
   /*) CACHE_MNT=(-v "$COMPILE_CACHE/vllm:/root/.cache/vllm"
-                -v "$COMPILE_CACHE/flashinfer:/root/.cache/flashinfer") ;;
+                -v "$COMPILE_CACHE/flashinfer:/root/.cache/flashinfer"
+                -v "$COMPILE_CACHE/triton:/root/.triton"
+                -v "$COMPILE_CACHE/nv:/root/.nv") ;;
   *)  CACHE_MNT=(-v "${COMPILE_CACHE}-vllm:/root/.cache/vllm"
-                -v "${COMPILE_CACHE}-flashinfer:/root/.cache/flashinfer") ;;
+                -v "${COMPILE_CACHE}-flashinfer:/root/.cache/flashinfer"
+                -v "${COMPILE_CACHE}-triton:/root/.triton"
+                -v "${COMPILE_CACHE}-nv:/root/.nv") ;;
 esac
 # General plugins (see PLUGIN_DIR above): a dir with *.dist-info on PYTHONPATH is discovered by
 # importlib.metadata without any pip install. expert_rt (vllm-serving/tools/expert_plugin) counts
@@ -290,16 +327,16 @@ docker run -d --name "$NAME" --restart unless-stopped \
   --gpus all --ipc=host --shm-size 16g -p "${PORT}:8000" \
   -v "$HF_CACHE:/hf" -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 \
   "${PROM_ARGS[@]}" \
-  "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" "${PLUGIN_MNT[@]}" \
+  "${CACHE_MNT[@]}" "${TEMPLATE_MNT[@]}" "${LOG_MNT[@]}" "${PLUGIN_MNT[@]}" \
   -e VLLM_PLE_MMAP=1 -e VLLM_PLE_MMAP_WORKERS="${WORKERS:-32}" -e VLLM_PLE_MMAP_PREWARM="$PREWARM" \
-  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" -e VLLM_FP8_PAD_M4="$PAD_M4" \
+  -e VLLM_QSA_EXACT_TOPK="$EXACT_TOPK" "${DETENV[@]}" \
   -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="$ALLOW_LONG" \
   "${HYBRID_ENV[@]}" \
   "$IMAGE" \
-  "$SNAP_IN" --served-model-name qwen3.8-flash-next \
+  "$SNAP_IN" --served-model-name "$SERVED_MODEL_NAME" \
     --host 0.0.0.0 --port 8000 --load-format safetensors \
     --max-model-len "$CTX" --max-num-seqs "$SEQS" --gpu-memory-utilization "$GPU_MEM" \
-    $PC_ARG --enable-chunked-prefill --max-num-batched-tokens 8192 \
+    $PC_ARG --enable-prompt-tokens-details --enable-chunked-prefill --max-num-batched-tokens 8192 \
     $CC \
     --no-enable-flashinfer-autotune \
     --kv-cache-dtype "$KV_DTYPE" ${KV_CACHE_MEM:+--kv-cache-memory-bytes "$KV_CACHE_MEM"} \
@@ -322,6 +359,6 @@ case "$STATE" in
     ;;
 esac
 
-echo ">> $NAME starting on :$PORT (model 'qwen3.8-flash-next', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, pad_m4=$PAD_M4, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
-echo ">> first boot loads ~75 GiB of weights (~8-13 min). Follow:  docker logs -f $NAME"
+echo ">> $NAME starting on :$PORT (model '$SERVED_MODEL_NAME', mode=$MODE, ctx $CTX, yarn=$YARN, mtp=$MTP, seqs=$SEQS, prefix_cache=$PREFIX_CACHE, det_topk=$DET_TOPK, exact_topk=$EXACT_TOPK, draft_vocab=$DRAFT_VOCAB, madvise=$MADVISE, fast_rows=$FAST_ROWS, effort_alias=$EFFORT_ALIAS_STATE${COMPILE_CACHE:+, compile_cache=$COMPILE_CACHE})"
+echo ">> first boot loads ~75 GiB of weights (~3-4 min). Follow:  docker logs -f $NAME"
 echo ">> ready when the log says 'Application startup complete'. Then: scripts/smoke-test.sh"

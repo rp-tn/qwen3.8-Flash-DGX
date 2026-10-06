@@ -9,17 +9,30 @@ Default behaviour unchanged."""
 import sys
 F = sys.argv[1]
 src = open(F).read()
-CALL = "        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)\n"
-assert src.count(CALL) == 1, "topk call site not found exactly once"
+# The `_topk` helper in ops/qsa_indexer.py, shared by the prefill and decode paths (vllm#54513).
+CALL = (
+    "    topk_op(\n"
+    "        logits,\n"
+    "        visible_blocks,\n"
+    "        block_indices,\n"
+    "        topk_workspace,\n"
+    "        block_topk,\n"
+    "        logits.shape[1],\n"
+    "    )\n"
+)
+if src.count(CALL) != 1:
+    raise SystemExit("topk call site not found exactly once in the QSA indexer")
 src = src.replace(CALL,
-    "        if _QSA_TOPK_MODE == \"1\":\n"
-    "            _qsa_exact_topk(logits, visible_blocks, blocks, block_topk, columns)\n"
-    "        elif _QSA_TOPK_MODE == \"fill\":\n"
-    "            _qsa_mask_invisible_(logits, visible_blocks, columns)\n"
-    "            topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)\n"
-    "        else:\n"
-    "            topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)\n")
-src = src.replace("import math\n", "import math\nimport os\n", 1)
+    "    columns = logits.shape[1]\n"
+    "    if _QSA_TOPK_MODE == \"1\":\n"
+    "        _qsa_exact_topk(logits, visible_blocks, block_indices, block_topk, columns)\n"
+    "    elif _QSA_TOPK_MODE == \"fill\":\n"
+    "        _qsa_mask_invisible_(logits, visible_blocks, columns)\n"
+    "        topk_op(logits, visible_blocks, block_indices, topk_workspace, block_topk, columns)\n"
+    "    else:\n"
+    "        topk_op(logits, visible_blocks, block_indices, topk_workspace, block_topk, columns)\n")
+if "\nimport os\n" not in src:
+    src = src.replace("import torch\n", "import os\nimport torch\n", 1)
 src += '''
 
 # --- GX10: QSA top-k variants (VLLM_QSA_EXACT_TOPK = 0 | 1 | fill), see vllm#51782 / qwen3.8-Flash-DGX#3 ---
@@ -61,4 +74,4 @@ def _qsa_exact_topk(logits, visible_blocks, blocks, block_topk, columns):
 '''
 open(F, "w").write(src)
 import ast; ast.parse(src)
-print("qsa.py: top-k variants (1|fill) added OK")
+print("qsa_indexer.py: top-k variants (1|fill) added OK")

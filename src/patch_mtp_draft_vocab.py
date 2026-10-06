@@ -9,7 +9,7 @@ and the logits of every other id are -inf, so the proposer's argmax/sampling cod
 The target still verifies every drafted token, so outputs are identical to full-vocabulary
 drafting; only the acceptance rate can move (down, when the target wants an id outside the set).
 
-usage: patch_mtp_draft_vocab.py <path to vllm/models/qwen3_8_flash_next/nvidia/mtp.py>
+usage: patch_mtp_draft_vocab.py <path to vllm/models/qwen4_exp/nvidia/mtp.py>
 Inert unless VLLM_MTP_DRAFT_VOCAB is set at runtime.
 """
 import sys
@@ -62,7 +62,7 @@ if MARK in src:
 import re
 m = re.search(r"^class (\w+MTP)\(", src, re.M)
 assert m, "MTP class not found (expected 'class <Name>MTP(')"
-MTP_CLASS = m.group(1)   # Qwen3_8FlashNextMTP on the preview image, Qwen4ExpMTP on vLLM >= 0.29
+MTP_CLASS = m.group(1)   # Qwen4ExpMTP
 open(TARGET, "w").write(src.rstrip("\n") + HOOK.replace("Qwen3_8FlashNextMTP", MTP_CLASS))
 import ast; ast.parse(open(TARGET).read())
 print("  draft-vocab hook INSTALLED in", TARGET, "(inert unless VLLM_MTP_DRAFT_VOCAB is set)")

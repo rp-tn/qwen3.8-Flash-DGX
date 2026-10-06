@@ -9,7 +9,7 @@
 #   ./flash doctor                  check docker, GPU, memory, disk, ports, image, weights
 #   ./flash setup [profile]         build the image, download the weights, prepare the checkpoint (idempotent)
 #   ./flash serve [profile] [K=V..] start the server (K=V overrides any serve.sh variable)
-#   ./flash wait                    block until the API answers (first boot: ~8-13 min)
+#   ./flash wait                    block until the API answers (first boot: ~3-4 min)
 #   ./flash test                    scripts/smoke-test.sh against the running server
 #   ./flash status | logs | stop | start | rm
 #   ./flash profiles                list the profiles and what they are for
@@ -38,9 +38,8 @@ WARNINGS=0; FAILURES=0
 
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
 
-# A profile is a plain KEY=VALUE env file. Two comment lines carry metadata:
+# A profile is a plain KEY=VALUE env file. One comment line carries metadata:
 #   # desc: one line shown by `flash profiles`
-#   # base: preview | v0.29   (which Dockerfile builds the image it expects)
 profile_file() {
   local p="$1"
   [ -f "$PROFILES_DIR/$p.env" ] || die "unknown profile '$p' — see: ./flash profiles"
@@ -72,13 +71,12 @@ load_profile() {
   export NAME="${NAME:-qwen38-flash}" PORT="${PORT:-18300}" MODE="${MODE:-nvfp4}"
   export MODEL="${MODEL:-$MODEL_DEFAULT}" HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
   export GPU_MEM="${GPU_MEM:-0.80}" KV_DTYPE="${KV_DTYPE:-auto}"
-  BASE_EXPECTED="$(profile_meta "$file" base)"; BASE_EXPECTED="${BASE_EXPECTED:-preview}"
-  if [ "$BASE_EXPECTED" = v0.29 ]; then
-    export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.29}"; DOCKERFILE="Dockerfile.v0.29"
-  else
-    export IMAGE="${IMAGE:-qwen38-flash-dgx}"; DOCKERFILE="Dockerfile"
-  fi
+  export IMAGE="${IMAGE:-qwen38-flash-dgx:v0.30}"
 }
+
+# The image carries LABEL qwen38.base=v0.30. Anything else (an older preview or v0.29 build under
+# the same name, or an unlabeled one) is rebuilt by setup and refused by serve.
+BASE_EXPECTED=v0.30
 
 # Same snapshot resolution as scripts/serve.sh (refs/main first).
 snapshot_dir() {
@@ -149,11 +147,14 @@ last_profile()     { cat "$STATE_DIR/profile.${NAME:-qwen38-flash}" 2>/dev/null 
 
 # ---------------------------------------------------------------- commands
 cmd_profiles() {
-  printf '%-12s %-7s %s\n' PROFILE BASE WHAT
+  printf '%-12s %s\n' PROFILE WHAT
+  local first=1
   for f in "$PROFILES_DIR/default.env" "$PROFILES_DIR"/*.env; do
     local p; p="$(basename "$f" .env)"
-    [ "$p" = default ] && [ "$f" != "$PROFILES_DIR/default.env" ] && continue
-    printf '%-12s %-7s %s\n' "$p" "$(profile_meta "$f" base | sed 's/^$/preview/')" "$(profile_meta "$f" desc)"
+    # default first, then the rest in glob order without default again
+    [ "$p" = default ] && [ "$first" = 0 ] && continue
+    first=0
+    printf '%-12s %s\n' "$p" "$(profile_meta "$f" desc)"
   done
   printf '\nserve one:  ./flash serve <profile>        override anything:  ./flash serve default MTP=3 PORT=18301\n'
   printf 'a profile is a plain env file in profiles/ — copy one to make your own.\n'
@@ -177,31 +178,36 @@ cmd_doctor() {
   else warn "nvidia-smi not found on the host (docker --gpus may still work)"; fi
 
   step "docker"
+  local docker_ok=0
   if ! command -v docker >/dev/null 2>&1; then fail "docker not installed"; else
-    if docker info >/dev/null 2>&1; then ok "docker daemon reachable ($(docker version --format '{{.Server.Version}}' 2>/dev/null))"; else fail "docker daemon not reachable (is your user in the docker group?)"; fi
+    if docker info >/dev/null 2>&1; then docker_ok=1; ok "docker daemon reachable ($(docker version --format '{{.Server.Version}}' 2>/dev/null))"; else fail "docker daemon not reachable (is your user in the docker group?)"; fi
     if docker info --format '{{range $k,$v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null | grep -q nvidia \
        || command -v nvidia-container-runtime >/dev/null 2>&1 || command -v nvidia-ctk >/dev/null 2>&1 \
        || ls /etc/cdi/*nvidia* /var/run/cdi/*nvidia* >/dev/null 2>&1; then ok "NVIDIA container toolkit present (docker --gpus all)"
     else warn "no NVIDIA container toolkit found (no nvidia runtime, nvidia-ctk or CDI spec) — install nvidia-container-toolkit if 'docker run --gpus all' fails"; fi
-    local others; others="$(docker ps --format '{{.Names}} ({{.Image}})' | grep -v "^$NAME " || true)"
-    if [ -n "$others" ]; then warn "other containers running — one big model at a time on this box:"; echo "$others" | sed 's/^/      /'; else ok "no other container running"; fi
+    if [ "$docker_ok" = 1 ]; then
+      local others; others="$(docker ps --format '{{.Names}} ({{.Image}})' | grep -v "^$NAME " || true)"
+      if [ -n "$others" ]; then warn "other containers running — one big model at a time on this box:"; echo "$others" | sed 's/^/      /'; else ok "no other container running"; fi
+    else warn "running containers not checked: no docker access"; fi
   fi
   if port_in_use "$PORT"; then
-    if [ "$(container_state)" = running ]; then info "port $PORT is held by $NAME itself (already serving)"; else fail "port $PORT already in use by something else — pick another: PORT=18301"; fi
+    if [ "$docker_ok" != 1 ]; then warn "port $PORT is in use; without docker access doctor cannot tell whether $NAME holds it"
+    elif [ "$(container_state)" = running ]; then info "port $PORT is held by $NAME itself (already serving)"; else fail "port $PORT already in use by something else — pick another: PORT=18301"; fi
   else ok "port $PORT free"; fi
 
   step "image"
-  if have_image; then
+  if [ "$docker_ok" != 1 ]; then warn "$IMAGE not checked: no docker access"
+  elif have_image; then
     local b; b="$(image_base)"
-    if [ -n "$b" ] && [ "$b" != "$BASE_EXPECTED" ]; then warn "$IMAGE is built from the '$b' base but profile '$profile' expects '$BASE_EXPECTED' — rebuild: ./flash setup $profile"; else ok "$IMAGE present (base: ${b:-unlabeled, pre-2026-09-11 build})"; fi
-  else info "$IMAGE not built yet — ./flash setup $profile will (about 1 min on the preview base, plus the pull)"; fi
+    if [ "$b" != "$BASE_EXPECTED" ]; then warn "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — rebuild: ./flash setup $profile"; else ok "$IMAGE present (base $b)"; fi
+  else info "$IMAGE not built yet — ./flash setup $profile will (a few minutes, plus the pull)"; fi
 
   step "weights ($MODEL in $HF_CACHE)"
   mkdir -p "$HF_CACHE" 2>/dev/null || true
   if [ -d "$HF_CACHE" ] && [ ! -w "$HF_CACHE" ]; then warn "$HF_CACHE is not writable by you (owner: $(stat -c %U "$HF_CACHE" 2>/dev/null)), typically a cache first created by a manual 'docker run -v'. Downloads still work (the container runs as root); serve.sh keeps its chat-template copy elsewhere. To own it: sudo chown -R \$USER $HF_CACHE"; fi
   local free; free="$(gib_free_at "$HF_CACHE")"
   if have_weights; then ok "checkpoint present: $(snapshot_dir)"; else
-    local sdir miss; sdir="$(snapshot_dir)"; miss="$( [ -n "$sdir" ] && missing_files "$sdir" shards )"
+    local sdir miss; sdir="$(snapshot_dir)"; miss="$( [ -z "$sdir" ] || missing_files "$sdir" shards )"
     if [ -n "$miss" ]; then warn "checkpoint INCOMPLETE, missing or dangling: $miss — re-run scripts/download-weights.sh (resumable), and prepare-hybrid.sh only after that"; else info "checkpoint not downloaded yet (126 GiB)"; fi
     if [ "${free:-0}" -ge 140 ]; then ok "${free} GB free on that filesystem (140 needed)"; else fail "${free:-?} GB free on that filesystem, 140 needed for the download"; fi
   fi
@@ -221,7 +227,6 @@ cmd_doctor() {
   if [ -n "${HF_TOKEN:-}${HUGGING_FACE_HUB_TOKEN:-}" ]; then ok "HF token in the environment"; else info "no HF_TOKEN: downloads work but the Hub may rate-limit; export HF_TOKEN=... to be safe"; fi
 
   step "profile sanity"
-  if [ "$BASE_EXPECTED" = v0.29 ] && [ "$KV_DTYPE" != auto ]; then fail "KV_DTYPE=$KV_DTYPE is not available on the v0.29 base (fp8 KV not ported) — use a preview-base profile"; fi
   if [ "${YARN:-0}" = 0 ] && [ "${CTX:-262144}" -gt 262144 ]; then fail "CTX=$CTX above the native 262144 needs YARN=1"; fi
   if [ "$KV_DTYPE" = auto ] && [ "${CTX:-262144}" -gt 500000 ]; then warn "CTX=$CTX in bf16 KV: 500k is the validated ceiling (800k got OOM-killed on a long prefill); 1M needs KV_DTYPE=fp8_e4m3"; fi
   [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ] && ok "profile looks fine"
@@ -235,12 +240,12 @@ cmd_doctor() {
 cmd_setup() {
   local profile="${1:-default}"; shift || true
   need_profile "$profile"; load_profile "$PROFILE_FILE" "$@"
-  echo "setup — profile '$profile' (image $IMAGE from $DOCKERFILE, mode $MODE). Every step is skipped when already done."
+  echo "setup — profile '$profile' (image $IMAGE, mode $MODE). Every step is skipped when already done."
 
   step "1/4 image $IMAGE"
   if have_image && [ "$(image_base)" = "$BASE_EXPECTED" ]; then ok "already built (base $BASE_EXPECTED)"; else
-    [ -f "$HERE/$DOCKERFILE" ] || die "$DOCKERFILE not found in $HERE"
-    run docker build -f "$HERE/$DOCKERFILE" -t "$IMAGE" "$HERE"; ok "built"; fi
+    [ -f "$HERE/Dockerfile" ] || die "Dockerfile not found in $HERE"
+    run docker build -t "$IMAGE" "$HERE"; ok "built"; fi
 
   step "2/4 weights ($MODEL, ~124 GiB, resumable)"
   if have_weights; then ok "already downloaded: $(snapshot_dir)"; else
@@ -274,9 +279,9 @@ cmd_serve() {
     local stale; stale="$(hybrid_stale)"; [ -z "$stale" ] || die "hybrid layout is missing $stale (prepared from an incomplete download, issue #17) — run scripts/prepare-hybrid.sh again, it repairs it" ;; esac
   [ "$MODE" = hybrid-mtp ] && { case "$MODEL" in RadixArk/*) ;; *) die "MODE=hybrid-mtp (the NVFP4 draft-experts graft) only applies to RadixArk/Qwen3.8-Flash-Next-NVFP4, whose MTP drafter is bf16; $MODEL already ships an fp8 drafter — use MODE=hybrid" ;; esac; have_graft || die "MTP graft not prepared — run: ./flash setup $profile"; }
   local b; b="$(image_base)"
-  [ -n "$b" ] && [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is a '$b'-base image, profile '$profile' expects '$BASE_EXPECTED' — run: ./flash setup $profile"
+  [ "$b" != "$BASE_EXPECTED" ] && die "$IMAGE is an old '${b:-unlabeled}' build, this recipe needs the $BASE_EXPECTED base — run: ./flash setup $profile"
   if [ "$(container_state)" = running ]; then info "$NAME is running and will be replaced"; fi
-  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|PORT|CTX|YARN|MTP|SEQS|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|PAD_M4|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|BASE|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
+  if [ "$DRY" = 1 ]; then info "dry run: would exec scripts/serve.sh with the environment above"; env | grep -E '^(MODE|IMAGE|NAME|SERVED_MODEL_NAME|PORT|CTX|YARN|MTP|SEQS|GPU_MEM|KV_DTYPE|PREFIX_CACHE|DET_TOPK|EXACT_TOPK|DRAFT_VOCAB|MADVISE|FAST_ROWS|EFFORT_ALIAS|PREWARM|COMPILE_CACHE|EXTRA|LOG_REQUESTS|WORKERS)=' | sort | sed 's/^/    /'; return 0; fi
   remember_profile "$profile"
   exec "$HERE/scripts/serve.sh"
 }
@@ -285,7 +290,7 @@ cmd_wait() {
   load_defaults_only
   local t0 deadline last="" state
   t0=$(date +%s); deadline=$((t0 + ${TIMEOUT:-1800}))
-  echo "waiting for $NAME on :$PORT (first boot loads ~75 GiB: 8-13 min; ctrl-c is safe, the server keeps loading)"
+  echo "waiting for $NAME on :$PORT (first boot loads ~75 GiB: ~3-4 min; ctrl-c is safe, the server keeps loading)"
   while :; do
     state="$(container_state)"
     case "$state" in
@@ -296,7 +301,8 @@ cmd_wait() {
     if api_up; then
       printf '\r%-100s\n' "  ready after $(( $(date +%s) - t0 )) s."
       docker logs "$NAME" 2>&1 | grep -E 'GPU KV cache size|Maximum concurrency' | tail -1 | sed 's/.*\[kv_cache_utils.*\] /  /'
-      echo "  API: http://localhost:$PORT/v1  (model 'qwen3.8-flash-next')   try: ./flash test"
+      MODEL_NAME="$(curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || echo unknown)"
+      echo "  API: http://localhost:$PORT/v1  (model '$MODEL_NAME')   try: ./flash test"
       return 0
     fi
     local l; l="$(docker logs --tail 40 "$NAME" 2>&1 | grep -E 'Loading safetensors|Loading weights took|Model loading took|torch.compile took|Capturing CUDA|KV cache size|prewarm|startup' | tail -1 | cut -c1-90 || true)"
@@ -346,7 +352,7 @@ main() {
     profiles) cmd_profiles ;;
     test)     load_defaults_only; exec "$HERE/scripts/smoke-test.sh" "localhost:$PORT" ;;
     logs)     load_defaults_only; exec docker logs -f --tail "${1:-100}" "$NAME" ;;
-    stop)     load_defaults_only; docker stop -t 30 "$NAME" && echo "$NAME stopped (kept; ./flash start reloads the same recipe, ~8-13 min)" ;;
+    stop)     load_defaults_only; docker stop -t 30 "$NAME" && echo "$NAME stopped (kept; ./flash start reloads the same recipe, ~3-4 min)" ;;
     start)    load_defaults_only; docker start "$NAME" >/dev/null && echo "$NAME starting — ./flash wait" ;;
     rm|down)  load_defaults_only; docker rm -f "$NAME" >/dev/null 2>&1 && echo "$NAME removed" || echo "no container $NAME" ;;
     help|-h|--help) usage ;;

@@ -9,11 +9,16 @@ set -euo pipefail
 LABEL="${1:?usage: greedy-probe.sh <label> [host:port]}"
 EP="${2:-localhost:18300}"
 mkdir -p "$HOME/q38-tmp/gate"
-python3 - "$EP" "$HOME/q38-tmp/gate/$LABEL.json" <<'PY'
+BASE="$EP"
+[[ "$BASE" == http* ]] || BASE="http://$BASE"
+
+MODEL="$(curl -sf -m 5 "$BASE/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)" || {
+  echo "!! could not determine served model from $BASE/v1/models"
+  exit 1
+}
+python3 - "$BASE" "$MODEL" "$HOME/q38-tmp/gate/$LABEL.json" <<'PY'
 import json, sys, time, urllib.request
-base, out = sys.argv[1], sys.argv[2]
-if not base.startswith("http"):
-    base = "http://" + base
+base, model, out = sys.argv[1], sys.argv[2], sys.argv[3]
 prompts = [
     "The capital of France is",
     "Write a haiku about a desktop supercomputer. /no_think",
@@ -23,7 +28,7 @@ prompts = [
 ]
 results = []
 for i, p in enumerate(prompts):
-    body = {"model": "qwen3.8-flash-next", "prompt": p, "max_tokens": 400,
+    body = {"model": model, "prompt": p, "max_tokens": 400,
             "temperature": 0, "logprobs": 3}
     t = time.time()
     req = urllib.request.Request(base + "/v1/completions", data=json.dumps(body).encode(),
